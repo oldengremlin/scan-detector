@@ -31,8 +31,8 @@ docker-інтеграції, без IPv6.
 
 | Файл | Призначення |
 |---|---|
-| `nft-scan-detector` | (Пере)генерує весь ruleset таблиці `inet scanDetector` і застосовує його атомарно (`nft -c -f` → `nft -f`). Викликається один раз при старті системи. |
-| `scan-detect-tool` | CLI для живого керування списками `trusted` / `ignore` / `permanentBlock` (додати, видалити, показати) — без перестворення таблиці. |
+| `src/bash/nft-scan-detector` | (Пере)генерує весь ruleset таблиці `inet scanDetector` і застосовує його атомарно (`nft -c -f` → `nft -f`). Викликається один раз при старті системи. |
+| `src/bash/scan-detect-tool` | CLI для живого керування списками `trusted` / `ignore` / `permanentBlock` (додати, видалити, показати) — без перестворення таблиці. |
 
 Обидва скрипти вважають файли в `/etc/nft-scandetect/*.list` єдиним джерелом
 правди для цих трьох списків (докладніше — нижче).
@@ -47,8 +47,8 @@ docker-інтеграції, без IPv6.
 ## Встановлення
 
 ```sh
-sudo install -m 755 nft-scan-detector /usr/local/sbin/nft-scan-detector
-sudo install -m 755 scan-detect-tool  /usr/local/sbin/scan-detect-tool
+sudo install -m 755 src/bash/nft-scan-detector /usr/local/sbin/nft-scan-detector
+sudo install -m 755 src/bash/scan-detect-tool  /usr/local/sbin/scan-detect-tool
 
 sudo install -m 644 systemd/scan-detector.service /etc/systemd/system/scan-detector.service
 sudo systemctl daemon-reload
@@ -104,6 +104,30 @@ flowchart TD
 - окремо для IPv4 (`trusted`, `ignore`, `permanentBlock`, `level0..15`, `scan`)
   і IPv6 (`trusted6`, `ignore6`, `permanentBlock6`, `level6_0..15`, `scan6`).
 
+## Live-стан між перезапусками `nft-scan-detector`
+
+`nft-scan-detector` завжди перестворює таблицю (`delete table` + `add table`)
+— так було і в оригінальному скрипті 10 років тому. Але тепер це більше не
+означає втрату прогресу: перед перестворенням береться знімок поточних
+елементів усіх dynamic-сетів (`scan`, `level0..level15`, `srv_normal/check0/check1/block`
+і їхніх IPv6-відповідників) разом із рештою таймауту, і одразу після
+перестворення сетів цей знімок відновлюється — в тій самій nft-транзакції
+(`nft -c -f` перевіряє й дамп, і відновлення разом з рештою ruleset).
+Знімок також зберігається в `/var/lib/nft-scandetect/live-state-<ts>.tsv` —
+поруч з аудитом самого ruleset.
+
+Якщо потрібна стара поведінка (наприклад, свідомо "амністувати" всіх, хто
+зараз у каскаді) — прапорець `--reset-live-state` вимикає збереження, і
+таблиця перестворюється з чистими сетами:
+
+```sh
+sudo nft-scan-detector --reset-live-state
+```
+
+Списки `trusted`/`ignore`/`permanentBlock` цього не стосуються — вони й так
+не втрачаються, бо йдуть через override-файли (нижче), а не через live-стан
+dynamic-сетів.
+
 ## Списки: trusted / ignore / permanentBlock
 
 - **trusted** — довірені джерела (напр. NOC-сервери), пропускаються (`return`) без обмежень.
@@ -137,20 +161,12 @@ override-файл у `/etc/nft-scandetect/`:
 
 ## Відомі обмеження і TODO
 
-- **Live-стан скидається при кожному запуску `nft-scan-detector`.** Скрипт
-  робить `delete table` + повне перестворення, тобто `scan`/`level*`/`srv_*`
-  (усе, що накопичив детектор про поточних "підозрюваних") зникає разом з
-  таблицею. Це прийнятно, поки скрипт запускається один раз при старті системи,
-  і свідомо залишено як є — логіка живе 10+ років і поки не готова до
-  кардинальної переробки. Якщо колись знадобиться періодичний перезапуск
-  (напр. для підхоплення нових docker-мереж без ребута) — знадобиться
-  зберігати/відновлювати live-стан або переходити на інкрементальне
-  застосування без `delete table`.
 - **Немає автоматичного підхоплення нових docker-мереж без перезапуску
   сервісу.** Зараз список bridge-інтерфейсів визначається один раз при
   запуску `nft-scan-detector`. Планується systemd-timer або docker
   event-хук, який рестартує сервіс при появі/зникненні docker-мережі —
-  з урахуванням обмеження вище.
+  тепер, коли live-стан переживає перезапуск, це вже не втратить прогрес
+  каскаду.
 - **Опціональне від'єднання від Docker.** Прапорець/env-змінна, що вимикає
   генерацію `forward`-правил і залишає лише `input` — для хостів без Docker
   або де docker-мережі захищаються інакше.

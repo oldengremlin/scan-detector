@@ -21,6 +21,13 @@
 #     з масиву таймаутів, а не виписані вручну;
 #   - інтерфейси docker-бриджів визначаються через `docker network inspect`.
 #
+# Live-стан (elements сетів scan/level*/srv_* та їхніх IPv6-відповідників):
+# за замовчуванням перед `delete table` знімається знімок поточних елементів
+# разом із рештою таймауту (nft -j + jq), а після перестворення сетів —
+# відновлюється (`add element ... timeout <решта>s`) в тій самій транзакції.
+# Прапорець --reset-live-state вимикає це і повертає стару поведінку —
+# таблиця перестворюється з чистими сетами, як і всі ці 10+ років.
+#
 # Override-файли (по одному значенню на рядок, коментарі через #):
 #   /etc/nft-scandetect/trusted-extra.list
 #   /etc/nft-scandetect/ignore-extra.list
@@ -34,6 +41,8 @@ set -euo pipefail
 TABLE="inet scanDetector"
 OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
+RESET_LIVE_STATE=0
+LIVE_STATE_FILE=""
 
 # level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
 LEVEL_TIMEOUTS=(3h 2h30m 2h 1h30m 1h 50m 40m 30m 20m 15m 10m 5m 4m 3m 2m 1m)
@@ -55,10 +64,37 @@ BASE_PERMANENT6=""
 
 # ---------------------------------------------------------------------------
 
+usage() {
+    cat <<EOF
+Використання: $(basename "$0") [--reset-live-state]
+
+За замовчуванням live-стан лічильників сканування (scan, level0..level15,
+srv_normal/check0/check1/block та їхні IPv6-відповідники) переживає
+перестворення таблиці: перед delete table знімається знімок поточних
+елементів разом із рештою таймауту, і одразу після перестворення сетів він
+відновлюється -- в тій самій nft-транзакції.
+
+  --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
+                        (стара поведінка: суцільний delete table без
+                        відновлення).
+  -h, --help            Ця довідка
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reset-live-state) RESET_LIVE_STATE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
 read_extra() {
     local file="$1"
     [[ -f "$file" ]] || return 0
-    grep -vE '^\s*(#|$)' "$file" | paste -sd, - | sed 's/,/, /g'
+    # grep без збігів (файл лише з коментарями/порожній) виходить з кодом 1 —
+    # це не помилка, а порожній список; `|| true` не дає pipefail завалити виклик
+    (grep -vE '^\s*(#|$)' "$file" || true) | paste -sd, - | sed 's/,/, /g'
 }
 
 # list_elements BASE_DEFAULT EXTRA_FILE
@@ -91,6 +127,43 @@ seed_if_missing() {
     } | sudo tee "$file" >/dev/null
 }
 
+# Знімає елементи всіх dynamic/timeout сетів живої таблиці (scan/level*/srv_*
+# та їхні IPv6-відповідники) разом із рештою таймауту -- у $LIVE_STATE_FILE,
+# по рядку "назва_сету<TAB>значення<TAB>решта_секунд". Статичних interval-сетів
+# (trusted/ignore/permanentBlock) це не стосується -- вони йдуть через
+# override-файли і в дамп не потрапляють (у них нема flags timeout).
+capture_live_state() {
+    [[ $RESET_LIVE_STATE -eq 1 ]] && return 0
+    sudo nft -j list table ${TABLE} 2>/dev/null | jq -r '
+        .nftables[]? | select(.set?) | .set |
+        select(.flags? and (.flags | index("timeout"))) |
+        .name as $n |
+        (.elem // [])[] |
+        (($n) + "\t" + (.elem.val) + "\t" +
+            (((.elem.expires // 1) | if . < 1 then 1 else . end) | tostring))
+    ' > "$LIVE_STATE_FILE" 2>/dev/null || true
+}
+
+# emit_restore SET_NAME -- якщо в знятому знімку є елементи для цього сету,
+# друкує "add element ${TABLE} SET_NAME { val1 timeout Ns, val2 timeout Ms }".
+# Викликається одразу після відповідного "add set" -- в тій самій транзакції.
+emit_restore() {
+    local set_name="$1"
+    [[ -s "$LIVE_STATE_FILE" ]] || return 0
+    local elems
+    elems=$(awk -F'\t' -v s="$set_name" '
+        $1 == s {
+            if (n++) printf ", "
+            printf "%s timeout %ss", $2, $3
+        }
+    ' "$LIVE_STATE_FILE")
+    # явний return 0 в кінці -- інакше під `set -e` порожній $elems (звичайнісінький
+    # випадок: для цього сету немає що відновлювати) повертає код 1 і мовчки
+    # вбиває весь скрипт, бо emit_restore викликається як bare-statement
+    [[ -n "$elems" ]] && echo "add element ${TABLE} ${set_name} { ${elems} }"
+    return 0
+}
+
 get_docker_bridges() {
     local netid name brname
     command -v docker >/dev/null 2>&1 || return 0
@@ -114,6 +187,7 @@ gen_level_sets() {
     local i
     for i in "${!LEVEL_TIMEOUTS[@]}"; do
         echo "add set ${TABLE} ${prefix}${i} { type ${family}; size 65535; flags dynamic,timeout; timeout ${LEVEL_TIMEOUTS[$i]}; comment \"SynScan Level ${i}\"; }"
+        emit_restore "${prefix}${i}"
     done
 }
 
@@ -127,6 +201,7 @@ gen_srv_sets() {
             normal) label="Normal" ;; check0) label="Check0" ;; check1) label="Check1" ;; block) label="Block" ;;
         esac
         echo "add set ${TABLE} ${prefix}${name} { type ${family}; size 65535; flags dynamic,timeout; timeout ${timeout}; comment \"Service ${label}\"; }"
+        emit_restore "${prefix}${name}"
     done
 }
 
@@ -196,6 +271,10 @@ build_ruleset() {
     ignore6=$(list_elements    "$BASE_IGNORE6"    "${OVERRIDE_DIR}/ignore6-extra.list")
     permanent6=$(list_elements "$BASE_PERMANENT6" "${OVERRIDE_DIR}/permanent6-extra.list")
 
+    # "add table" перед "delete table" — гарантує, що таблиця існує на момент
+    # видалення (інакше на чистому хості, де таблиці ще нема, і "nft -c -f",
+    # і сам "delete table" валяться з "No such file or directory")
+    echo "add table ${TABLE}"
     echo "delete table ${TABLE}"
     echo "add table ${TABLE}"
 
@@ -222,8 +301,10 @@ build_ruleset() {
     # --- level0..level15 / level6_0..level6_15 ---
     gen_level_sets ipv4_addr level
     echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    emit_restore "scan"
     gen_level_sets ipv6_addr level6_
     echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    emit_restore "scan6"
 
     # --- ланцюги ---
     echo "add chain ${TABLE} input { type filter hook input priority -50; }"
@@ -262,7 +343,12 @@ main() {
     local ts tmpfile
     ts=$(date +%Y%m%d-%H%M%S)
     tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
-    trap 'rm -f "${tmpfile:-}"' EXIT
+    LIVE_STATE_FILE=$(mktemp /tmp/nft-scandetect.XXXXXX.state)
+    trap 'rm -f "${tmpfile:-}" "${LIVE_STATE_FILE:-}"' EXIT
+
+    # знімок ПЕРЕД перестворенням таблиці -- поки жива таблиця ще не займана
+    capture_live_state
+    sudo cp "$LIVE_STATE_FILE" "${AUDIT_DIR}/live-state-${ts}.tsv"
 
     build_ruleset > "$tmpfile"
     sudo cp "$tmpfile" "${AUDIT_DIR}/ruleset-${ts}.nft"
@@ -280,4 +366,4 @@ main() {
     sudo nft list table ${TABLE}
 }
 
-main "$@"
+main
