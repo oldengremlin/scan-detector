@@ -1,0 +1,18 @@
+[Unit]
+Description=nft-scan-detector — застосування таблиці inet scanDetector
+Documentation=https://github.com/oldengremlin/scan-detector
+# Docker — опційна залежність: якщо docker.service в системі відсутній,
+# systemd просто ігнорує цей рядок ordering, юніт стартує без Docker
+# (nft-scan-detector сам пропускає forward-правила, коли docker недоступний).
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nft-scan-detector
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
