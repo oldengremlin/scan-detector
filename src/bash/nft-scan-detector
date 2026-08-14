@@ -42,6 +42,7 @@ TABLE="inet scanDetector"
 OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
 RESET_LIVE_STATE=0
+NO_DOCKER=0
 LIVE_STATE_FILE=""
 
 # level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
@@ -66,7 +67,7 @@ BASE_PERMANENT6=""
 
 usage() {
     cat <<EOF
-Використання: $(basename "$0") [--reset-live-state]
+Використання: $(basename "$0") [--reset-live-state] [--no-docker]
 
 За замовчуванням live-стан лічильників сканування (scan, level0..level15,
 srv_normal/check0/check1/block та їхні IPv6-відповідники) переживає
@@ -77,6 +78,10 @@ srv_normal/check0/check1/block та їхні IPv6-відповідники) пе
   --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
                         (стара поведінка: суцільний delete table без
                         відновлення).
+  --no-docker           Не генерувати ланцюг forward і per-bridge правила --
+                        лишається тільки input. Активується й автоматично,
+                        якщо бінарника docker немає на хості. Незалежний від
+                        --reset-live-state -- прапорці вільно комбінуються.
   -h, --help            Ця довідка
 EOF
 }
@@ -84,10 +89,19 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --reset-live-state) RESET_LIVE_STATE=1; shift ;;
+        --no-docker) NO_DOCKER=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
     esac
 done
+
+# Docker відсутній на хості (не лише daemon недоступний, а самого бінарника
+# нема) -- це стала, а не тимчасова умова, тож --no-docker вмикається сама
+# собою, без потреби пам'ятати про прапорець
+if [[ $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
+    echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
+    NO_DOCKER=1
+fi
 
 read_extra() {
     local file="$1"
@@ -308,7 +322,6 @@ build_ruleset() {
 
     # --- ланцюги ---
     echo "add chain ${TABLE} input { type filter hook input priority -50; }"
-    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
 
     # --- input: ipv4 ---
     gen_static_guard_rules input
@@ -320,7 +333,12 @@ build_ruleset() {
     gen_srv_rules input ip6 srv6_
     gen_level_rules input ip6 level6_ scan6
 
-    # --- forward: per docker bridge ---
+    # --- forward: тільки якщо Docker не вимкнено -- інакше ланцюга forward
+    # у таблиці взагалі нема, і hook forward цю таблицю не чіпає
+    [[ $NO_DOCKER -eq 1 ]] && return 0
+
+    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
+
     local iface ifm
     while read -r iface; do
         [[ -z "$iface" ]] && continue
@@ -334,6 +352,7 @@ build_ruleset() {
         gen_srv_rules forward ip6 srv6_ "$ifm"
         gen_level_rules forward ip6 level6_ scan6 "$ifm"
     done < <(get_docker_bridges)
+    return 0
 }
 
 # ---------------------------------------------------------------------------
