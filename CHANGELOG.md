@@ -14,6 +14,9 @@
 - `systemd/scan-detector.service` — юніт для запуску `nft-scan-detector` після
   старту Docker (опційна залежність через `After=`, без `Requires=`), як заміна
   виклику з `/etc/rc.local`.
+- Розділ "Історія" в README — походження ідеї (MikroTik RouterOS), попередня
+  вужча реалізація на `iptables`+`ipset` (лише SSH-брутфорс), час появи
+  поточної nftables-версії.
 
 ### Заплановано (див. README → TODO)
 - Збереження live-стану `scan`/`level*`/`srv_*` між перезапусками `nft-scan-detector`.
