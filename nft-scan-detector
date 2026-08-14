@@ -1,0 +1,283 @@
+#!/bin/bash
+
+# nft-scan-detector — (пере)створює таблицю inet scanDetector атомарно через nft -f.
+#
+# Працює в парі зі scan-detect-tool: обидва скрипти вважають файли в
+# OVERRIDE_DIR єдиним джерелом правди для trusted/ignore/permanentBlock.
+#
+#   - Якщо override-файл існує (навіть порожній) — він ПОВНІСТЮ перекриває
+#     відповідний BASE_* (це не merge, а заміна). BASE_* лишається лише
+#     "заводським" значенням для першого запуску — далі скрипт його
+#     нікуди не підмішує.
+#   - scan-detect-tool є "власником" файлів: він додає/видаляє рядки і
+#     одразу застосовує зміну наживо. При першому зверненні до списку,
+#     що ще не має override-файлу, scan-detect-tool сам бутстрапить файл
+#     поточним станом живого сету (тобто тими самими BASE_*, які цей
+#     скрипт туди раніше поклав) — так дефолти не губляться.
+#   - вся конфігурація формується в один буфер і застосовується ОДНІЄЮ
+#     транзакцією (nft -c -f для перевірки синтаксису, потім nft -f) —
+#     без escaping-пекла і без десятків окремих sudo-викликів;
+#   - каскади level0..level15 / level6_0..level6_15 генеруються циклом
+#     з масиву таймаутів, а не виписані вручну;
+#   - інтерфейси docker-бриджів визначаються через `docker network inspect`.
+#
+# Override-файли (по одному значенню на рядок, коментарі через #):
+#   /etc/nft-scandetect/trusted-extra.list
+#   /etc/nft-scandetect/ignore-extra.list
+#   /etc/nft-scandetect/permanent-extra.list
+#   /etc/nft-scandetect/trusted6-extra.list
+#   /etc/nft-scandetect/ignore6-extra.list
+#   /etc/nft-scandetect/permanent6-extra.list
+
+set -euo pipefail
+
+TABLE="inet scanDetector"
+OVERRIDE_DIR="/etc/nft-scandetect"
+AUDIT_DIR="/var/lib/nft-scandetect"
+
+# level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
+LEVEL_TIMEOUTS=(3h 2h30m 2h 1h30m 1h 50m 40m 30m 20m 15m 10m 5m 4m 3m 2m 1m)
+LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
+
+# srv_* сети: назва -> таймаут
+SRV_STAGES=(normal:5s check0:10s check1:15s block:1m)
+
+# "Заводські" дефолти — застосовуються ТІЛЬКИ якщо відповідного
+# override-файлу ще нема на диску (перший запуск / чиста система).
+# Після появи файлу зміни в цей масив ігноруються — редагуйте файл
+# або керуйте через scan-detect-tool.
+BASE_TRUSTED="127.0.0.1"
+BASE_IGNORE="0.0.0.0"
+BASE_PERMANENT=""
+BASE_IGNORE6="fe80::/64"
+BASE_TRUSTED6="::1/128"
+BASE_PERMANENT6=""
+
+# ---------------------------------------------------------------------------
+
+read_extra() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    grep -vE '^\s*(#|$)' "$file" | paste -sd, - | sed 's/,/, /g'
+}
+
+# list_elements BASE_DEFAULT EXTRA_FILE
+# Якщо EXTRA_FILE існує — він ПОВНІСТЮ перекриває BASE_DEFAULT (не merge).
+# Якщо файлу нема — використовується BASE_DEFAULT (перший запуск).
+list_elements() {
+    local base_default="$1" file="$2"
+    if [[ -f "$file" ]]; then
+        read_extra "$file"
+    else
+        echo "$base_default"
+    fi
+}
+
+# seed_if_missing FILE BASE_DEFAULT_COMMA_SEPARATED
+# Якщо файл ще не існує — створює його з BASE_* (по одному значенню на
+# рядок), щоб scan-detect-tool у майбутньому мав що бутстрапити і щоб
+# інспекція /etc/nft-scandetect одразу показувала актуальний стан, а не
+# "порожньо, бо дефолти лежать десь у коді".
+seed_if_missing() {
+    local file="$1" base_default="$2"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    {
+        echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із заводських дефолтів."
+        echo "# Цей файл тепер є джерелом правди для цього списку — керуйте через scan-detect-tool."
+        if [[ -n "$base_default" ]]; then
+            echo "$base_default" | tr ',' '\n' | sed 's/^ *//; s/ *$//'
+        fi
+    } | sudo tee "$file" >/dev/null
+}
+
+get_docker_bridges() {
+    local netid name brname
+    command -v docker >/dev/null 2>&1 || return 0
+    docker network ls --filter driver=bridge -q 2>/dev/null | while read -r netid; do
+        name=$(docker network inspect "$netid" --format '{{ .Name }}')
+        [[ "$name" == "bridge" ]] && continue
+        brname=$(docker network inspect "$netid" --format '{{ index .Options "com.docker.network.bridge.name" }}')
+        [[ -z "$brname" ]] && brname="br-${netid}"
+        if ip link show "$brname" &>/dev/null; then
+            echo "$brname"
+        else
+            echo "УВАГА: $brname (мережа $name) очікувалась, але не знайдена в 'ip link'" >&2
+        fi
+    done | sort -u
+}
+
+# --- генератори фрагментів nft-синтаксису ---
+
+gen_level_sets() {
+    local family="$1" prefix="$2"     # ipv4_addr|ipv6_addr ; level|level6_
+    local i
+    for i in "${!LEVEL_TIMEOUTS[@]}"; do
+        echo "add set ${TABLE} ${prefix}${i} { type ${family}; size 65535; flags dynamic,timeout; timeout ${LEVEL_TIMEOUTS[$i]}; comment \"SynScan Level ${i}\"; }"
+    done
+}
+
+gen_srv_sets() {
+    local family="$1" prefix="$2"     # ipv4_addr|ipv6_addr ; srv_|srv6_
+    local stage name timeout
+    for stage in "${SRV_STAGES[@]}"; do
+        name="${stage%%:*}"; timeout="${stage##*:}"
+        local label="$name"
+        case "$name" in
+            normal) label="Normal" ;; check0) label="Check0" ;; check1) label="Check1" ;; block) label="Block" ;;
+        esac
+        echo "add set ${TABLE} ${prefix}${name} { type ${family}; size 65535; flags dynamic,timeout; timeout ${timeout}; comment \"Service ${label}\"; }"
+    done
+}
+
+gen_srv_rules() {
+    # gen_srv_rules CHAIN PROTO PREFIX IFACE_MATCH
+    local chain="$1" proto="$2" prefix="$3" ifm="${4:-}"
+    local normal="${prefix}normal" c0="${prefix}check0" c1="${prefix}check1" block="${prefix}block"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c1} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${normal} add @${normal} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr @${normal} counter return"
+}
+
+gen_level_rules() {
+    # gen_level_rules CHAIN PROTO PREFIX SCAN_SET IFACE_MATCH
+    local chain="$1" proto="$2" prefix="$3" scan="$4" ifm="${5:-}"
+    local i next
+
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ${proto} saddr != @${scan} ${proto} saddr @${prefix}0 add @${scan} { ${proto} saddr } counter"
+
+    for ((i = 0; i < LAST_LEVEL; i++)); do
+        next=$((i + 1))
+        echo "add rule ${TABLE} ${chain} ${ifm}ct state new ${proto} saddr != @${prefix}${i} ${proto} saddr @${prefix}${next} add @${prefix}${i} { ${proto} saddr } counter"
+    done
+
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ${proto} saddr != @${prefix}${LAST_LEVEL} add @${prefix}${LAST_LEVEL} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ${proto} saddr @${scan} update @${scan} { ${proto} saddr } counter log prefix \"[nft] scandetect-${chain}-drop \" drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}${proto} saddr @${scan} update @${scan} { ${proto} saddr } counter log prefix \"[nft] scandetect-${chain}-another-drop \" drop"
+}
+
+gen_static_guard_rules() {
+    # permanentBlock / trusted / ignore -- для input (без iface-match) чи forward (з ним)
+    local chain="$1" ifm="${2:-}"
+    echo "add rule ${TABLE} ${chain} ${ifm}ip saddr @permanentBlock counter drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip saddr @trusted counter return"
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip saddr @ignore counter return"
+}
+
+gen_static_guard6_rules() {
+    # permanentBlock6 / trusted6 / ignore6
+    local chain="$1" ifm="${2:-}"
+    echo "add rule ${TABLE} ${chain} ${ifm}ip6 saddr @permanentBlock6 counter drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip6 saddr @trusted6 counter return"
+    echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip6 saddr @ignore6 counter return"
+}
+
+# --- побудова повного ruleset ---
+
+build_ruleset() {
+    # спершу сіємо файли, яких ще нема -- щоб /etc/nft-scandetect завжди
+    # відображав актуальний стан, а не приховані в коді дефолти
+    seed_if_missing "${OVERRIDE_DIR}/trusted-extra.list"    "$BASE_TRUSTED"
+    seed_if_missing "${OVERRIDE_DIR}/ignore-extra.list"     "$BASE_IGNORE"
+    seed_if_missing "${OVERRIDE_DIR}/permanent-extra.list"  "$BASE_PERMANENT"
+    seed_if_missing "${OVERRIDE_DIR}/trusted6-extra.list"   "$BASE_TRUSTED6"
+    seed_if_missing "${OVERRIDE_DIR}/ignore6-extra.list"    "$BASE_IGNORE6"
+    seed_if_missing "${OVERRIDE_DIR}/permanent6-extra.list" "$BASE_PERMANENT6"
+
+    local trusted ignore permanent trusted6 ignore6 permanent6
+
+    trusted=$(list_elements    "$BASE_TRUSTED"    "${OVERRIDE_DIR}/trusted-extra.list")
+    ignore=$(list_elements     "$BASE_IGNORE"     "${OVERRIDE_DIR}/ignore-extra.list")
+    permanent=$(list_elements  "$BASE_PERMANENT"  "${OVERRIDE_DIR}/permanent-extra.list")
+    trusted6=$(list_elements   "$BASE_TRUSTED6"   "${OVERRIDE_DIR}/trusted6-extra.list")
+    ignore6=$(list_elements    "$BASE_IGNORE6"    "${OVERRIDE_DIR}/ignore6-extra.list")
+    permanent6=$(list_elements "$BASE_PERMANENT6" "${OVERRIDE_DIR}/permanent6-extra.list")
+
+    echo "delete table ${TABLE}"
+    echo "add table ${TABLE}"
+
+    # --- статичні IPv4 сети ---
+    echo "add set ${TABLE} trusted { type ipv4_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    [[ -n "$trusted" ]] && echo "add element ${TABLE} trusted { ${trusted} }"
+    echo "add set ${TABLE} ignore { type ipv4_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    [[ -n "$ignore" ]] && echo "add element ${TABLE} ignore { ${ignore} }"
+    echo "add set ${TABLE} permanentBlock { type ipv4_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
+    [[ -n "$permanent" ]] && echo "add element ${TABLE} permanentBlock { ${permanent} }"
+
+    # --- статичні IPv6 сети ---
+    echo "add set ${TABLE} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    [[ -n "$trusted6" ]] && echo "add element ${TABLE} trusted6 { ${trusted6} }"
+    echo "add set ${TABLE} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    [[ -n "$ignore6" ]] && echo "add element ${TABLE} ignore6 { ${ignore6} }"
+    echo "add set ${TABLE} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
+    [[ -n "$permanent6" ]] && echo "add element ${TABLE} permanentBlock6 { ${permanent6} }"
+
+    # --- srv_* / srv6_* ---
+    gen_srv_sets ipv4_addr srv_
+    gen_srv_sets ipv6_addr srv6_
+
+    # --- level0..level15 / level6_0..level6_15 ---
+    gen_level_sets ipv4_addr level
+    echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    gen_level_sets ipv6_addr level6_
+    echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+
+    # --- ланцюги ---
+    echo "add chain ${TABLE} input { type filter hook input priority -50; }"
+    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
+
+    # --- input: ipv4 ---
+    gen_static_guard_rules input
+    gen_srv_rules input ip srv_
+    gen_level_rules input ip level scan
+
+    # --- input: ipv6 ---
+    gen_static_guard6_rules input
+    gen_srv_rules input ip6 srv6_
+    gen_level_rules input ip6 level6_ scan6
+
+    # --- forward: per docker bridge ---
+    local iface ifm
+    while read -r iface; do
+        [[ -z "$iface" ]] && continue
+        ifm="iifname != ${iface} oifname ${iface} "
+
+        gen_static_guard_rules forward "$ifm"
+        gen_srv_rules forward ip srv_ "$ifm"
+        gen_level_rules forward ip level scan "$ifm"
+
+        gen_static_guard6_rules forward "$ifm"
+        gen_srv_rules forward ip6 srv6_ "$ifm"
+        gen_level_rules forward ip6 level6_ scan6 "$ifm"
+    done < <(get_docker_bridges)
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    sudo mkdir -p "$AUDIT_DIR"
+    local ts tmpfile
+    ts=$(date +%Y%m%d-%H%M%S)
+    tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
+    trap 'rm -f "${tmpfile:-}"' EXIT
+
+    build_ruleset > "$tmpfile"
+    sudo cp "$tmpfile" "${AUDIT_DIR}/ruleset-${ts}.nft"
+
+    echo "Перевірка синтаксису..." >&2
+    if ! sudo nft -c -f "$tmpfile"; then
+        echo "Помилка синтаксису — таблицю НЕ чіпаю, поточний ruleset залишається без змін." >&2
+        echo "Файл для аналізу: ${AUDIT_DIR}/ruleset-${ts}.nft" >&2
+        exit 1
+    fi
+
+    echo "Застосовую атомарно..." >&2
+    sudo nft -f "$tmpfile"
+
+    sudo nft list table ${TABLE}
+}
+
+main "$@"

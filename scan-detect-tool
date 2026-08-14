@@ -1,0 +1,313 @@
+#!/bin/bash
+
+# scan-detect-tool — керування IP-адресами в таблиці inet scanDetector
+#
+# Працює в парі з nft-scan-detector: обидва скрипти вважають файли в
+# /etc/nft-scandetect єдиним джерелом правди для trusted/ignore/permanentBlock.
+# Ця команда:
+#   1. редагує відповідний *-extra.list файл (додає/видаляє рядок);
+#   2. одразу застосовує ту саму зміну до живої таблиці через nft.
+#
+# Якщо список ще не має override-файлу (перший запуск на цьому списку),
+# файл спершу бутстрапиться поточним станом ЖИВОГО сету -- щоб заводські
+# дефолти з nft-scan-detector (BASE_TRUSTED тощо) не загубились.
+#
+# Використання:
+#   scan-detect-tool --delete IP           видалити IP звідусіль (живі сети +
+#                                           будь-який override-файл, де він є)
+#   scan-detect-tool --add-ignore IP       додати в ignore/ignore6
+#   scan-detect-tool --add-trusted IP      додати в trusted/trusted6
+#   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
+#   scan-detect-tool --list IP             показати живі сети + override-файли, де є IP
+#   scan-detect-tool --dry-run ...         показати команди, нічого не змінюючи
+#
+# Вимоги: nft, jq
+
+set -euo pipefail
+
+TABLE_FAMILY="inet"
+TABLE_NAME="scanDetector"
+OVERRIDE_DIR="/etc/nft-scandetect"
+DRY_RUN=0
+
+usage() {
+    cat <<EOF
+Використання: $(basename "$0") [--dry-run] КОМАНДА IP
+
+Команди:
+  --delete IP           Видалити IP з усіх живих сетів і з усіх override-файлів,
+                         де він знайдений
+  --add-ignore IP        Додати IP в ignore (ignore6 для IPv6)
+  --add-trusted IP       Додати IP в trusted (trusted6 для IPv6)
+  --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
+  --list IP              Показати живі сети та override-файли, де присутній IP
+
+Опції:
+  --dry-run              Показати команди/дії, нічого не застосовуючи
+  -h, --help              Ця довідка
+EOF
+    exit 1
+}
+
+is_ipv6() {
+    [[ "$1" == *:* ]]
+}
+
+validate_ip() {
+    local ip="$1"
+    if is_ipv6 "$ip"; then
+        [[ "$ip" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] || { echo "Помилка: '$ip' не схоже на IPv6-адресу" >&2; exit 1; }
+    else
+        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || { echo "Помилка: '$ip' не схоже на IPv4-адресу" >&2; exit 1; }
+    fi
+}
+
+# Виконує або друкує nft-команду залежно від --dry-run
+run_nft() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) nft $*"
+    else
+        sudo nft "$@"
+    fi
+}
+
+# --- відповідність kind(+родина) -> назва сету в nft / назва override-файлу ---
+# kind: trusted | ignore | permanent
+
+set_name_for() {
+    local kind="$1" ip="$2"
+    case "$kind" in
+        trusted)   is_ipv6 "$ip" && echo trusted6         || echo trusted ;;
+        ignore)    is_ipv6 "$ip" && echo ignore6          || echo ignore ;;
+        permanent) is_ipv6 "$ip" && echo permanentBlock6  || echo permanentBlock ;;
+        *) echo "Внутрішня помилка: невідомий kind '$kind'" >&2; exit 1 ;;
+    esac
+}
+
+extra_file_for() {
+    local kind="$1" ip="$2"
+    case "$kind" in
+        trusted)   is_ipv6 "$ip" && echo "${OVERRIDE_DIR}/trusted6-extra.list"   || echo "${OVERRIDE_DIR}/trusted-extra.list" ;;
+        ignore)    is_ipv6 "$ip" && echo "${OVERRIDE_DIR}/ignore6-extra.list"    || echo "${OVERRIDE_DIR}/ignore-extra.list" ;;
+        permanent) is_ipv6 "$ip" && echo "${OVERRIDE_DIR}/permanent6-extra.list" || echo "${OVERRIDE_DIR}/permanent-extra.list" ;;
+        *) echo "Внутрішня помилка: невідомий kind '$kind'" >&2; exit 1 ;;
+    esac
+}
+
+# Список усіх шести override-файлів (для --delete і --list)
+all_extra_files() {
+    printf '%s\n' \
+        "${OVERRIDE_DIR}/trusted-extra.list" \
+        "${OVERRIDE_DIR}/ignore-extra.list" \
+        "${OVERRIDE_DIR}/permanent-extra.list" \
+        "${OVERRIDE_DIR}/trusted6-extra.list" \
+        "${OVERRIDE_DIR}/ignore6-extra.list" \
+        "${OVERRIDE_DIR}/permanent6-extra.list"
+}
+
+# Витягує елементи ЖИВОГО (статичного, interval) сету у вигляді "по одному
+# значенню на рядок" -- враховує і прості значення, і CIDR-об'єкти {"prefix":...}.
+live_set_elements() {
+    local set_name="$1"
+    sudo nft -j list set "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" 2>/dev/null | jq -r '
+        .nftables[]? | select(.set?) | .set.elem[]? |
+        if type=="object" then
+            if has("prefix") then "\(.prefix.addr)/\(.prefix.len)" else empty end
+        else .
+        end
+    ' 2>/dev/null || true
+}
+
+# Якщо override-файл ще не існує -- створює його з поточного стану ЖИВОГО
+# сету (щоб дефолти nft-scan-detector не загубились при першому редагуванні).
+ensure_bootstrapped() {
+    local set_name="$1" file="$2"
+    [[ -f "$file" ]] && return 0
+
+    sudo mkdir -p "$OVERRIDE_DIR"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) файл $file відсутній — бутстрапнув би його поточним станом сету $set_name" >&2
+        return 0
+    fi
+
+    echo "Файл $file відсутній — ініціалізую поточним станом сету $set_name (щоб не загубити дефолти)." >&2
+    local existing
+    existing=$(live_set_elements "$set_name")
+    {
+        echo "# Ініціалізовано scan-detect-tool $(date '+%Y-%m-%d %H:%M:%S') зі стану живого сету ${set_name}"
+        if [[ -n "$existing" ]]; then
+            printf '%s\n' "$existing"
+        fi
+    } | sudo tee "$file" >/dev/null
+}
+
+# Дописує IP у файл, якщо його там ще нема (порівняння точне, по всьому рядку)
+append_if_missing() {
+    local file="$1" value="$2"
+    if [[ -f "$file" ]] && grep -qxF -- "$value" "$file" 2>/dev/null; then
+        echo "  (вже є в $file — файл не змінюю)"
+        return 0
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) echo '$value' >> $file"
+    else
+        echo "$value" | sudo tee -a "$file" >/dev/null
+        echo "  + дописано в $file"
+    fi
+}
+
+# Видаляє рядок з файлу, якщо він там є (атомарно, без sed-екранування)
+remove_if_present() {
+    local file="$1" value="$2"
+    [[ -f "$file" ]] || return 0
+    grep -qxF -- "$value" "$file" 2>/dev/null || return 0
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) видалив би рядок '$value' з $file"
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp)
+    grep -vxF -- "$value" "$file" | sudo tee "$tmp" >/dev/null
+    sudo install -m "$(stat -c %a "$file")" -o "$(stat -c %U "$file")" -g "$(stat -c %G "$file")" "$tmp" "$file"
+    rm -f "$tmp"
+    echo "  - видалено з $file"
+}
+
+# --- пошук IP у живих сетах (level*, scan*, trusted/ignore/permanent...) ---
+find_live_sets_with_ip() {
+    local ip="$1"
+    sudo nft -j list table "${TABLE_FAMILY}" "${TABLE_NAME}" | jq -r --arg ip "$ip" '
+        .nftables[]
+        | select(.set?)
+        | .set
+        | select(
+            .elem? and any(.elem[]?;
+                (if type=="object" then
+                    (.elem.val // (if has("prefix") then "\(.prefix.addr)/\(.prefix.len)" else empty end))
+                 else .
+                 end) == $ip)
+          )
+        | .name
+    '
+}
+
+cmd_list() {
+    local ip="$1"
+    validate_ip "$ip"
+
+    local sets
+    sets=$(find_live_sets_with_ip "$ip")
+    if [[ -z "$sets" ]]; then
+        echo "IP $ip не знайдено в жодному живому сеті таблиці ${TABLE_NAME}."
+    else
+        echo "IP $ip знайдено в живих сетах:"
+        echo "$sets" | sed 's/^/  - /'
+    fi
+
+    echo "Присутність в override-файлах:"
+    local found_any=0 f
+    while IFS= read -r f; do
+        if [[ -f "$f" ]] && grep -qxF -- "$ip" "$f" 2>/dev/null; then
+            echo "  - $f"
+            found_any=1
+        fi
+    done < <(all_extra_files)
+    [[ $found_any -eq 0 ]] && echo "  (ніде)"
+    return 0
+}
+
+cmd_delete() {
+    local ip="$1"
+    validate_ip "$ip"
+
+    local sets
+    sets=$(find_live_sets_with_ip "$ip")
+    if [[ -z "$sets" ]]; then
+        echo "IP $ip не знайдено в жодному живому сеті."
+    else
+        echo "Видаляю $ip з живих сетів:"
+        while IFS= read -r set_name; do
+            [[ -z "$set_name" ]] && continue
+            echo "  - $set_name"
+            run_nft delete element "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" "{ $ip }"
+        done <<< "$sets"
+    fi
+
+    echo "Прибираю $ip з override-файлів (якщо є) -- щоб не повернувся після перебудови:"
+    local f any_removed=0
+    while IFS= read -r f; do
+        if [[ -f "$f" ]] && grep -qxF -- "$ip" "$f" 2>/dev/null; then
+            remove_if_present "$f" "$ip"
+            any_removed=1
+        fi
+    done < <(all_extra_files)
+    [[ $any_removed -eq 0 ]] && echo "  (у файлах не знайдено)"
+    return 0
+}
+
+# cmd_add KIND IP  -- KIND: trusted | ignore | permanent
+cmd_add() {
+    local kind="$1" ip="$2"
+    validate_ip "$ip"
+
+    local set_name file
+    set_name=$(set_name_for "$kind" "$ip")
+    file=$(extra_file_for "$kind" "$ip")
+
+    ensure_bootstrapped "$set_name" "$file"
+
+    echo "Додаю $ip у $kind ($set_name):"
+    append_if_missing "$file" "$ip"
+
+    run_nft add element "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" "{ $ip }" \
+        || echo "УВАГА: не вдалось застосувати наживо (таблиця/сет ще не створені? запустіть nft-scan-detector)." >&2
+}
+
+# --- разбір аргументів ---
+
+[[ $# -eq 0 ]] && usage
+
+ACTION=""
+IP=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --delete)
+            ACTION="delete"; IP="${2:-}"; shift 2 ;;
+        --add-ignore)
+            ACTION="add-ignore"; IP="${2:-}"; shift 2 ;;
+        --add-trusted)
+            ACTION="add-trusted"; IP="${2:-}"; shift 2 ;;
+        --add-permanent)
+            ACTION="add-permanent"; IP="${2:-}"; shift 2 ;;
+        --list)
+            ACTION="list"; IP="${2:-}"; shift 2 ;;
+        --dry-run)
+            DRY_RUN=1; shift ;;
+        -h|--help)
+            usage ;;
+        *)
+            echo "Невідома опція: $1" >&2
+            usage ;;
+    esac
+done
+
+if [[ -z "$ACTION" || -z "$IP" ]]; then
+    echo "Помилка: не вказано команду або IP-адресу." >&2
+    usage
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "Помилка: потрібен jq (apt install jq)." >&2
+    exit 1
+fi
+
+case "$ACTION" in
+    delete)        cmd_delete "$IP" ;;
+    add-ignore)    cmd_add ignore    "$IP" ;;
+    add-trusted)   cmd_add trusted   "$IP" ;;
+    add-permanent) cmd_add permanent "$IP" ;;
+    list)          cmd_list "$IP" ;;
+esac
