@@ -17,7 +17,6 @@
 - Розділ "Історія" в README — походження ідеї (MikroTik RouterOS), попередня
   вужча реалізація на `iptables`+`ipset` (лише SSH-брутфорс), час появи
   поточної nftables-версії.
-
 - `src/bash/` — `nft-scan-detector` і `scan-detect-tool` перенесені сюди з
   кореня репозиторію.
 - Збереження/відновлення live-стану `scan`/`level0..level15`/`srv_*`
@@ -33,6 +32,18 @@
   і per-bridge правила, лишається тільки `input`. Вмикається і вручну, і
   автоматично, якщо на хості немає бінарника `docker`. Незалежний від
   `--reset-live-state` — прапорці вільно комбінуються.
+- Прапорці `--stop`/`--stop-docker` у `nft-scan-detector` — окремий режим,
+  який атомарно знімає ланцюг `forward` із живої таблиці (`input`, сети й
+  live-стан не чіпає), не перегенеровуючи нічого. `--stop-docker` додатково
+  зупиняє `docker.socket`, потім `docker.service`. Взаємовиключні з
+  `--reset-live-state`/`--no-docker`. Повернення `forward` — звичайний
+  запуск без `--stop*`.
+- `src/bash/docker-network-watch` + `systemd/docker-network-watch.service` —
+  опційний слухач `docker events` (create/destroy мереж), що рестартує
+  `scan-detector.service` при появі/зникненні docker-бриджа, з дебаунсом
+  (2s тиші) на серію подій від одної дії (напр. `docker compose up`).
+  `Requires=docker.service` у юніті — зупиняється разом з Docker, зокрема
+  через `--stop-docker`.
 
 ### Виправлено
 - **Перший запуск на чистому хості завжди падав.** `nft -c -f` (dry-run
@@ -47,5 +58,3 @@
   1, і через `pipefail` це мовчки завершувало весь скрипт. Тепер порожній
   результат grep не вважається помилкою.
 
-### Заплановано (див. README → TODO)
-- Автоматичне підхоплення нових docker-мереж без ручного рестарту сервісу.

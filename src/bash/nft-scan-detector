@@ -43,6 +43,8 @@ OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
 RESET_LIVE_STATE=0
 NO_DOCKER=0
+STOP=0
+STOP_DOCKER=0
 LIVE_STATE_FILE=""
 
 # level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
@@ -68,20 +70,29 @@ BASE_PERMANENT6=""
 usage() {
     cat <<EOF
 Використання: $(basename "$0") [--reset-live-state] [--no-docker]
+       $(basename "$0") --stop | --stop-docker
 
-За замовчуванням live-стан лічильників сканування (scan, level0..level15,
-srv_normal/check0/check1/block та їхні IPv6-відповідники) переживає
-перестворення таблиці: перед delete table знімається знімок поточних
-елементів разом із рештою таймауту, і одразу після перестворення сетів він
-відновлюється -- в тій самій nft-транзакції.
+Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без --stop*:
 
   --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
                         (стара поведінка: суцільний delete table без
-                        відновлення).
+                        відновлення). За замовчуванням live-стан
+                        (scan/level0..level15/srv_* і IPv6-відповідники)
+                        переживає перестворення таблиці.
   --no-docker           Не генерувати ланцюг forward і per-bridge правила --
                         лишається тільки input. Активується й автоматично,
                         якщо бінарника docker немає на хості. Незалежний від
                         --reset-live-state -- прапорці вільно комбінуються.
+
+--stop / --stop-docker -- окремий режим, нічого не перегенеровує, а лише
+знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не чіпає).
+Корисно перед зупинкою Docker -- forward з великою кількістю per-bridge
+правил заважає docker чисто "гаситись". Щоб повернути forward -- достатньо
+звичайного запуску без --stop*. Взаємовиключні з --reset-live-state/--no-docker.
+
+  --stop                Зняти ланцюг forward, більше нічого не робити.
+  --stop-docker          Те саме, що --stop, і додатково зупинити
+                        docker.socket та docker.service (у цьому порядку).
   -h, --help            Ця довідка
 EOF
 }
@@ -90,15 +101,23 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --reset-live-state) RESET_LIVE_STATE=1; shift ;;
         --no-docker) NO_DOCKER=1; shift ;;
+        --stop) STOP=1; shift ;;
+        --stop-docker) STOP=1; STOP_DOCKER=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
     esac
 done
 
+if [[ $STOP -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
+    echo "Помилка: --stop/--stop-docker не можна комбінувати з --reset-live-state/--no-docker." >&2
+    exit 1
+fi
+
 # Docker відсутній на хості (не лише daemon недоступний, а самого бінарника
 # нема) -- це стала, а не тимчасова умова, тож --no-docker вмикається сама
-# собою, без потреби пам'ятати про прапорець
-if [[ $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
+# собою, без потреби пам'ятати про прапорець. У режимі --stop* це не має
+# значення -- взагалі не чіпаємо docker тут.
+if [[ $STOP -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
     echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
     NO_DOCKER=1
 fi
@@ -355,6 +374,39 @@ build_ruleset() {
     return 0
 }
 
+# --- --stop / --stop-docker ---
+
+# Атомарно знімає ланцюг forward із ЖИВОЇ таблиці (окрема мінітранзакція,
+# теж через nft -c -f -> nft -f) -- input, усі сети й live-стан не чіпає.
+# Щоб повернути forward -- достатньо звичайного запуску nft-scan-detector.
+do_stop() {
+    if ! sudo nft list chain ${TABLE} forward >/dev/null 2>&1; then
+        echo "Ланцюг forward відсутній -- нічого знімати." >&2
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
+    echo "delete chain ${TABLE} forward" > "$tmpfile"
+
+    echo "Знімаю ланцюг forward (docker-правила scanDetector)..." >&2
+    if ! sudo nft -c -f "$tmpfile"; then
+        echo "Помилка синтаксису під час зняття forward -- нічого не чіпаю." >&2
+        rm -f "$tmpfile"
+        exit 1
+    fi
+    sudo nft -f "$tmpfile"
+    rm -f "$tmpfile"
+    echo "Ланцюг forward знято. input і всі сети (live-стан) лишились без змін." >&2
+}
+
+do_stop_docker() {
+    echo "Зупиняю docker.socket, потім docker.service (у цьому порядку -- щоб" >&2
+    echo "socket-activation не підняла docker.service назад)..." >&2
+    sudo systemctl stop docker.socket
+    sudo systemctl stop docker.service
+}
+
 # ---------------------------------------------------------------------------
 
 main() {
@@ -384,5 +436,11 @@ main() {
 
     sudo nft list table ${TABLE}
 }
+
+if [[ $STOP -eq 1 ]]; then
+    do_stop
+    [[ $STOP_DOCKER -eq 1 ]] && do_stop_docker
+    exit 0
+fi
 
 main

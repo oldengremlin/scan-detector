@@ -1,0 +1,29 @@
+#!/bin/bash
+
+# docker-network-watch — слухає docker events (створення/видалення мереж) і
+# рестартує scan-detector.service, щоб nft-scan-detector підхопив нові чи
+# зниклі docker-бриджі без ручного втручання.
+#
+# Живий стан каскаду (scan/level0..level15/srv_*) переживає такий рестарт --
+# див. --reset-live-state у nft-scan-detector -- тож рестарт нічого не коштує.
+#
+# Розрахований на запуск під systemd (docker-network-watch.service):
+# якщо docker events обірветься (daemon перезапускається, недоступний і
+# т.п.) -- скрипт просто завершується, і Restart=always в юніті підніме
+# його знову за кілька секунд.
+
+set -euo pipefail
+
+# Невеликий дебаунс: коли одна дія (напр. `docker compose up`) створює
+# одразу кілька мереж, події прилітають серією -- чекаємо 2s тиші після
+# останньої, перш ніж рестартувати, щоб не смикати сервіс на кожну окремо.
+DEBOUNCE_SECONDS=2
+
+docker events --filter type=network --filter event=create --filter event=destroy \
+    --format '{{.Action}} {{.Actor.Attributes.name}}' |
+while read -r action name; do
+    echo "docker network ${action}: ${name}" >&2
+    while read -r -t "$DEBOUNCE_SECONDS" _; do :; done
+    echo "Рестартую scan-detector.service..." >&2
+    systemctl restart scan-detector.service
+done

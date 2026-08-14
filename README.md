@@ -33,6 +33,7 @@ docker-інтеграції, без IPv6.
 |---|---|
 | `src/bash/nft-scan-detector` | (Пере)генерує весь ruleset таблиці `inet scanDetector` і застосовує його атомарно (`nft -c -f` → `nft -f`). Викликається один раз при старті системи. |
 | `src/bash/scan-detect-tool` | CLI для живого керування списками `trusted` / `ignore` / `permanentBlock` (додати, видалити, показати) — без перестворення таблиці. |
+| `src/bash/docker-network-watch` | Слухає `docker events` і рестартує `scan-detector.service` при появі/зникненні docker-мережі. Опційний компонент — див. розділ нижче. |
 
 Обидва скрипти вважають файли в `/etc/nft-scandetect/*.list` єдиним джерелом
 правди для цих трьох списків (докладніше — нижче).
@@ -150,6 +151,59 @@ IP-рівень graylisting), тож `--no-docker` ніяк не заважає 
 і навпаки — наприклад, `--reset-live-state --no-docker` разом скидає live-стан
 і водночас не створює `forward`.
 
+### `--stop` / `--stop-docker`
+
+Окремий режим — нічого не перегенеровує, лише знімає ланцюг `forward` із
+**живої** таблиці (`input`, усі сети й live-стан не чіпає). Взаємовиключний
+з `--reset-live-state`/`--no-docker` (це прапорці генерації, а `--stop*` її
+взагалі не запускає).
+
+Навіщо: `forward` із великою кількістю per-bridge правил (16 рівнів × dual
+stack × кожен bridge) заважає Docker чисто "гаситись" — daemon під час
+зупинки посилає купу netlink-подій на видалення бриджів/veth, і активний
+hook на `forward` це лише сповільнює. `--stop` знімає цей hook заздалегідь:
+
+```sh
+sudo nft-scan-detector --stop            # тільки зняти forward
+sudo nft-scan-detector --stop-docker     # зняти forward + systemctl stop docker.socket docker.service
+```
+
+`--stop-docker` зупиняє спершу `docker.socket`, потім `docker.service` (у
+цьому порядку — інакше socket-activation підніме `docker.service` назад
+щойно хтось звернеться до сокета). Щоб повернути `forward` — достатньо
+звичайного запуску `nft-scan-detector` (без `--stop*`) після того, як Docker
+знову працює.
+
+## Автопідхоплення docker-мереж: `docker-network-watch`
+
+`nft-scan-detector` визначає список docker-бриджів один раз при запуску.
+Якщо ти рідко, але додаєш/прибираєш docker-мережі "на живу" — щоб новий
+bridge підхопився в `forward` без ручного рестарту сервісу, є окремий
+слухач подій Docker: `src/bash/docker-network-watch` +
+`systemd/docker-network-watch.service`.
+
+Як це працює: скрипт підписується на `docker events --filter type=network`
+(create/destroy), і на кожну таку подію викликає
+`systemctl restart scan-detector.service`. Live-стан каскаду переживає цей
+рестарт (див. `--reset-live-state` вище), тож рестарт нічого не коштує.
+Якщо кілька мереж з'являються одна за одною (напр. `docker compose up`
+одразу створює декілька) — вбудований дебаунс (2s тиші після останньої
+події) згортає серію в один рестарт, а не по одному на кожну мережу.
+
+Встановлення:
+
+```sh
+sudo install -m 755 src/bash/docker-network-watch /usr/local/sbin/docker-network-watch
+sudo install -m 644 systemd/docker-network-watch.service /etc/systemd/system/docker-network-watch.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-network-watch.service
+```
+
+Юніт має `Requires=docker.service` — якщо Docker на хості явно зупинити
+(зокрема через `nft-scan-detector --stop-docker`), слухач зупиниться разом
+з ним, а не крутитиметься марно в `Restart=always`. Якщо на хості взагалі
+немає Docker — цей юніт не потрібен, не enable-ти його.
+
 ## Списки: trusted / ignore / permanentBlock
 
 - **trusted** — довірені джерела (напр. NOC-сервери), пропускаються (`return`) без обмежень.
@@ -183,12 +237,9 @@ override-файл у `/etc/nft-scandetect/`:
 
 ## Відомі обмеження і TODO
 
-- **Немає автоматичного підхоплення нових docker-мереж без перезапуску
-  сервісу.** Зараз список bridge-інтерфейсів визначається один раз при
-  запуску `nft-scan-detector`. Планується systemd-timer або docker
-  event-хук, який рестартує сервіс при появі/зникненні docker-мережі —
-  тепер, коли live-стан переживає перезапуск, це вже не втратить прогрес
-  каскаду.
+Наразі суттєвих відкритих обмежень нема — автопідхоплення docker-мереж
+закрито `docker-network-watch` (вище), зупинка перед вимкненням Docker —
+`--stop`/`--stop-docker`, live-стан переживає будь-який із цих рестартів.
 
 ## Ліцензія
 
