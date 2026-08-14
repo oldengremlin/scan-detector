@@ -1,0 +1,20 @@
+[Unit]
+Description=nft-scan-detector — слухач docker network events, рестартує scan-detector.service
+Documentation=https://github.com/oldengremlin/scan-detector
+# Юніт має сенс лише разом з docker.service. Якщо docker.service в системі
+# відсутній -- systemd просто ігнорує ordering, а сам скрипт (docker events)
+# одразу впаде і піде на Restart=always -- нескінченний, але дешевий цикл.
+# Якщо Docker на хості взагалі нема -- цей юніт краще не enable-ити (див. README).
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/docker-network-watch
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

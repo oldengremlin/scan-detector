@@ -21,6 +21,13 @@
 #     з масиву таймаутів, а не виписані вручну;
 #   - інтерфейси docker-бриджів визначаються через `docker network inspect`.
 #
+# Live-стан (elements сетів scan/level*/srv_* та їхніх IPv6-відповідників):
+# за замовчуванням перед `delete table` знімається знімок поточних елементів
+# разом із рештою таймауту (nft -j + jq), а після перестворення сетів —
+# відновлюється (`add element ... timeout <решта>s`) в тій самій транзакції.
+# Прапорець --reset-live-state вимикає це і повертає стару поведінку —
+# таблиця перестворюється з чистими сетами, як і всі ці 10+ років.
+#
 # Override-файли (по одному значенню на рядок, коментарі через #):
 #   /etc/nft-scandetect/trusted-extra.list
 #   /etc/nft-scandetect/ignore-extra.list
@@ -34,6 +41,11 @@ set -euo pipefail
 TABLE="inet scanDetector"
 OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
+RESET_LIVE_STATE=0
+NO_DOCKER=0
+STOP=0
+STOP_DOCKER=0
+LIVE_STATE_FILE=""
 
 # level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
 LEVEL_TIMEOUTS=(3h 2h30m 2h 1h30m 1h 50m 40m 30m 20m 15m 10m 5m 4m 3m 2m 1m)
@@ -55,10 +67,67 @@ BASE_PERMANENT6=""
 
 # ---------------------------------------------------------------------------
 
+usage() {
+    cat <<EOF
+Використання: $(basename "$0") [--reset-live-state] [--no-docker]
+       $(basename "$0") --stop | --stop-docker
+
+Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без --stop*:
+
+  --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
+                        (стара поведінка: суцільний delete table без
+                        відновлення). За замовчуванням live-стан
+                        (scan/level0..level15/srv_* і IPv6-відповідники)
+                        переживає перестворення таблиці.
+  --no-docker           Не генерувати ланцюг forward і per-bridge правила --
+                        лишається тільки input. Активується й автоматично,
+                        якщо бінарника docker немає на хості. Незалежний від
+                        --reset-live-state -- прапорці вільно комбінуються.
+
+--stop / --stop-docker -- окремий режим, нічого не перегенеровує, а лише
+знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не чіпає).
+Корисно перед зупинкою Docker -- forward з великою кількістю per-bridge
+правил заважає docker чисто "гаситись". Щоб повернути forward -- достатньо
+звичайного запуску без --stop*. Взаємовиключні з --reset-live-state/--no-docker.
+
+  --stop                Зняти ланцюг forward, більше нічого не робити.
+  --stop-docker          Те саме, що --stop, і додатково зупинити
+                        docker.socket та docker.service (у цьому порядку).
+  -h, --help            Ця довідка
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reset-live-state) RESET_LIVE_STATE=1; shift ;;
+        --no-docker) NO_DOCKER=1; shift ;;
+        --stop) STOP=1; shift ;;
+        --stop-docker) STOP=1; STOP_DOCKER=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
+    esac
+done
+
+if [[ $STOP -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
+    echo "Помилка: --stop/--stop-docker не можна комбінувати з --reset-live-state/--no-docker." >&2
+    exit 1
+fi
+
+# Docker відсутній на хості (не лише daemon недоступний, а самого бінарника
+# нема) -- це стала, а не тимчасова умова, тож --no-docker вмикається сама
+# собою, без потреби пам'ятати про прапорець. У режимі --stop* це не має
+# значення -- взагалі не чіпаємо docker тут.
+if [[ $STOP -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
+    echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
+    NO_DOCKER=1
+fi
+
 read_extra() {
     local file="$1"
     [[ -f "$file" ]] || return 0
-    grep -vE '^\s*(#|$)' "$file" | paste -sd, - | sed 's/,/, /g'
+    # grep без збігів (файл лише з коментарями/порожній) виходить з кодом 1 —
+    # це не помилка, а порожній список; `|| true` не дає pipefail завалити виклик
+    (grep -vE '^\s*(#|$)' "$file" || true) | paste -sd, - | sed 's/,/, /g'
 }
 
 # list_elements BASE_DEFAULT EXTRA_FILE
@@ -91,6 +160,43 @@ seed_if_missing() {
     } | sudo tee "$file" >/dev/null
 }
 
+# Знімає елементи всіх dynamic/timeout сетів живої таблиці (scan/level*/srv_*
+# та їхні IPv6-відповідники) разом із рештою таймауту -- у $LIVE_STATE_FILE,
+# по рядку "назва_сету<TAB>значення<TAB>решта_секунд". Статичних interval-сетів
+# (trusted/ignore/permanentBlock) це не стосується -- вони йдуть через
+# override-файли і в дамп не потрапляють (у них нема flags timeout).
+capture_live_state() {
+    [[ $RESET_LIVE_STATE -eq 1 ]] && return 0
+    sudo nft -j list table ${TABLE} 2>/dev/null | jq -r '
+        .nftables[]? | select(.set?) | .set |
+        select(.flags? and (.flags | index("timeout"))) |
+        .name as $n |
+        (.elem // [])[] |
+        (($n) + "\t" + (.elem.val) + "\t" +
+            (((.elem.expires // 1) | if . < 1 then 1 else . end) | tostring))
+    ' > "$LIVE_STATE_FILE" 2>/dev/null || true
+}
+
+# emit_restore SET_NAME -- якщо в знятому знімку є елементи для цього сету,
+# друкує "add element ${TABLE} SET_NAME { val1 timeout Ns, val2 timeout Ms }".
+# Викликається одразу після відповідного "add set" -- в тій самій транзакції.
+emit_restore() {
+    local set_name="$1"
+    [[ -s "$LIVE_STATE_FILE" ]] || return 0
+    local elems
+    elems=$(awk -F'\t' -v s="$set_name" '
+        $1 == s {
+            if (n++) printf ", "
+            printf "%s timeout %ss", $2, $3
+        }
+    ' "$LIVE_STATE_FILE")
+    # явний return 0 в кінці -- інакше під `set -e` порожній $elems (звичайнісінький
+    # випадок: для цього сету немає що відновлювати) повертає код 1 і мовчки
+    # вбиває весь скрипт, бо emit_restore викликається як bare-statement
+    [[ -n "$elems" ]] && echo "add element ${TABLE} ${set_name} { ${elems} }"
+    return 0
+}
+
 get_docker_bridges() {
     local netid name brname
     command -v docker >/dev/null 2>&1 || return 0
@@ -114,6 +220,7 @@ gen_level_sets() {
     local i
     for i in "${!LEVEL_TIMEOUTS[@]}"; do
         echo "add set ${TABLE} ${prefix}${i} { type ${family}; size 65535; flags dynamic,timeout; timeout ${LEVEL_TIMEOUTS[$i]}; comment \"SynScan Level ${i}\"; }"
+        emit_restore "${prefix}${i}"
     done
 }
 
@@ -127,6 +234,7 @@ gen_srv_sets() {
             normal) label="Normal" ;; check0) label="Check0" ;; check1) label="Check1" ;; block) label="Block" ;;
         esac
         echo "add set ${TABLE} ${prefix}${name} { type ${family}; size 65535; flags dynamic,timeout; timeout ${timeout}; comment \"Service ${label}\"; }"
+        emit_restore "${prefix}${name}"
     done
 }
 
@@ -196,6 +304,10 @@ build_ruleset() {
     ignore6=$(list_elements    "$BASE_IGNORE6"    "${OVERRIDE_DIR}/ignore6-extra.list")
     permanent6=$(list_elements "$BASE_PERMANENT6" "${OVERRIDE_DIR}/permanent6-extra.list")
 
+    # "add table" перед "delete table" — гарантує, що таблиця існує на момент
+    # видалення (інакше на чистому хості, де таблиці ще нема, і "nft -c -f",
+    # і сам "delete table" валяться з "No such file or directory")
+    echo "add table ${TABLE}"
     echo "delete table ${TABLE}"
     echo "add table ${TABLE}"
 
@@ -222,12 +334,13 @@ build_ruleset() {
     # --- level0..level15 / level6_0..level6_15 ---
     gen_level_sets ipv4_addr level
     echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    emit_restore "scan"
     gen_level_sets ipv6_addr level6_
     echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    emit_restore "scan6"
 
     # --- ланцюги ---
     echo "add chain ${TABLE} input { type filter hook input priority -50; }"
-    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
 
     # --- input: ipv4 ---
     gen_static_guard_rules input
@@ -239,7 +352,12 @@ build_ruleset() {
     gen_srv_rules input ip6 srv6_
     gen_level_rules input ip6 level6_ scan6
 
-    # --- forward: per docker bridge ---
+    # --- forward: тільки якщо Docker не вимкнено -- інакше ланцюга forward
+    # у таблиці взагалі нема, і hook forward цю таблицю не чіпає
+    [[ $NO_DOCKER -eq 1 ]] && return 0
+
+    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
+
     local iface ifm
     while read -r iface; do
         [[ -z "$iface" ]] && continue
@@ -253,6 +371,40 @@ build_ruleset() {
         gen_srv_rules forward ip6 srv6_ "$ifm"
         gen_level_rules forward ip6 level6_ scan6 "$ifm"
     done < <(get_docker_bridges)
+    return 0
+}
+
+# --- --stop / --stop-docker ---
+
+# Атомарно знімає ланцюг forward із ЖИВОЇ таблиці (окрема мінітранзакція,
+# теж через nft -c -f -> nft -f) -- input, усі сети й live-стан не чіпає.
+# Щоб повернути forward -- достатньо звичайного запуску nft-scan-detector.
+do_stop() {
+    if ! sudo nft list chain ${TABLE} forward >/dev/null 2>&1; then
+        echo "Ланцюг forward відсутній -- нічого знімати." >&2
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
+    echo "delete chain ${TABLE} forward" > "$tmpfile"
+
+    echo "Знімаю ланцюг forward (docker-правила scanDetector)..." >&2
+    if ! sudo nft -c -f "$tmpfile"; then
+        echo "Помилка синтаксису під час зняття forward -- нічого не чіпаю." >&2
+        rm -f "$tmpfile"
+        exit 1
+    fi
+    sudo nft -f "$tmpfile"
+    rm -f "$tmpfile"
+    echo "Ланцюг forward знято. input і всі сети (live-стан) лишились без змін." >&2
+}
+
+do_stop_docker() {
+    echo "Зупиняю docker.socket, потім docker.service (у цьому порядку -- щоб" >&2
+    echo "socket-activation не підняла docker.service назад)..." >&2
+    sudo systemctl stop docker.socket
+    sudo systemctl stop docker.service
 }
 
 # ---------------------------------------------------------------------------
@@ -262,7 +414,12 @@ main() {
     local ts tmpfile
     ts=$(date +%Y%m%d-%H%M%S)
     tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
-    trap 'rm -f "${tmpfile:-}"' EXIT
+    LIVE_STATE_FILE=$(mktemp /tmp/nft-scandetect.XXXXXX.state)
+    trap 'rm -f "${tmpfile:-}" "${LIVE_STATE_FILE:-}"' EXIT
+
+    # знімок ПЕРЕД перестворенням таблиці -- поки жива таблиця ще не займана
+    capture_live_state
+    sudo cp "$LIVE_STATE_FILE" "${AUDIT_DIR}/live-state-${ts}.tsv"
 
     build_ruleset > "$tmpfile"
     sudo cp "$tmpfile" "${AUDIT_DIR}/ruleset-${ts}.nft"
@@ -280,4 +437,10 @@ main() {
     sudo nft list table ${TABLE}
 }
 
-main "$@"
+if [[ $STOP -eq 1 ]]; then
+    do_stop
+    [[ $STOP_DOCKER -eq 1 ]] && do_stop_docker
+    exit 0
+fi
+
+main

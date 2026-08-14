@@ -31,8 +31,9 @@ docker-інтеграції, без IPv6.
 
 | Файл | Призначення |
 |---|---|
-| `nft-scan-detector` | (Пере)генерує весь ruleset таблиці `inet scanDetector` і застосовує його атомарно (`nft -c -f` → `nft -f`). Викликається один раз при старті системи. |
-| `scan-detect-tool` | CLI для живого керування списками `trusted` / `ignore` / `permanentBlock` (додати, видалити, показати) — без перестворення таблиці. |
+| `src/bash/nft-scan-detector` | (Пере)генерує весь ruleset таблиці `inet scanDetector` і застосовує його атомарно (`nft -c -f` → `nft -f`). Викликається один раз при старті системи. |
+| `src/bash/scan-detect-tool` | CLI для живого керування списками `trusted` / `ignore` / `permanentBlock` (додати, видалити, показати) — без перестворення таблиці. |
+| `src/bash/docker-network-watch` | Слухає `docker events` і рестартує `scan-detector.service` при появі/зникненні docker-мережі. Опційний компонент — див. розділ нижче. |
 
 Обидва скрипти вважають файли в `/etc/nft-scandetect/*.list` єдиним джерелом
 правди для цих трьох списків (докладніше — нижче).
@@ -42,13 +43,13 @@ docker-інтеграції, без IPv6.
 - Linux з `nftables` (утиліта `nft`, версія з підтримкою `flags dynamic,timeout` та JSON-виводу `-j`)
 - `jq` — потрібен `scan-detect-tool` для розбору `nft -j`
 - `sudo` — обидва скрипти викликають привілейовані команди через `sudo` (працює як з-під звичайного користувача з sudo-правами, так і з-під root)
-- Docker — опційно; якщо `docker` відсутній у `PATH`, `forward`-правила для контейнерів просто не генеруються, `input` продовжує працювати як завжди
+- Docker — опційно; якщо `docker` відсутній у `PATH`, `nft-scan-detector` сам вмикає режим `--no-docker`: ланцюг `forward` узагалі не створюється, `input` продовжує працювати як завжди
 
 ## Встановлення
 
 ```sh
-sudo install -m 755 nft-scan-detector /usr/local/sbin/nft-scan-detector
-sudo install -m 755 scan-detect-tool  /usr/local/sbin/scan-detect-tool
+sudo install -m 755 src/bash/nft-scan-detector /usr/local/sbin/nft-scan-detector
+sudo install -m 755 src/bash/scan-detect-tool  /usr/local/sbin/scan-detect-tool
 
 sudo install -m 644 systemd/scan-detector.service /etc/systemd/system/scan-detector.service
 sudo systemctl daemon-reload
@@ -104,6 +105,105 @@ flowchart TD
 - окремо для IPv4 (`trusted`, `ignore`, `permanentBlock`, `level0..15`, `scan`)
   і IPv6 (`trusted6`, `ignore6`, `permanentBlock6`, `level6_0..15`, `scan6`).
 
+## Прапорці `nft-scan-detector`
+
+Обидва прапорці незалежні один від одного й вільно комбінуються в будь-якому
+порядку — кожен впливає на свою частину ruleset і не залежить від іншого.
+
+### `--reset-live-state`
+
+`nft-scan-detector` завжди перестворює таблицю (`delete table` + `add table`)
+— так було і в оригінальному скрипті 10 років тому. Але тепер це більше не
+означає втрату прогресу: перед перестворенням береться знімок поточних
+елементів усіх dynamic-сетів (`scan`, `level0..level15`, `srv_normal/check0/check1/block`
+і їхніх IPv6-відповідників) разом із рештою таймауту, і одразу після
+перестворення сетів цей знімок відновлюється — в тій самій nft-транзакції
+(`nft -c -f` перевіряє й дамп, і відновлення разом з рештою ruleset).
+Знімок також зберігається в `/var/lib/nft-scandetect/live-state-<ts>.tsv` —
+поруч з аудитом самого ruleset.
+
+Якщо потрібна стара поведінка (наприклад, свідомо "амністувати" всіх, хто
+зараз у каскаді) — прапорець вимикає збереження, і таблиця перестворюється
+з чистими сетами:
+
+```sh
+sudo nft-scan-detector --reset-live-state
+```
+
+Списки `trusted`/`ignore`/`permanentBlock` цього не стосуються — вони й так
+не втрачаються, бо йдуть через override-файли (нижче), а не через live-стан
+dynamic-сетів.
+
+### `--no-docker`
+
+Вимикає генерацію ланцюга `forward` і всіх per-bridge правил — лишається
+тільки `input`. Для хостів без Docker або де docker-мережі захищаються
+інакше. Вмикається і вручну, і автоматично — якщо на хості немає бінарника
+`docker`, `nft-scan-detector` сам про це попереджає в stderr і працює так,
+ніби прапорець передали:
+
+```sh
+sudo nft-scan-detector --no-docker
+```
+
+Сети `level*`/`scan`/`srv_*` спільні для `input` і `forward` (це той самий
+IP-рівень graylisting), тож `--no-docker` ніяк не заважає `--reset-live-state`
+і навпаки — наприклад, `--reset-live-state --no-docker` разом скидає live-стан
+і водночас не створює `forward`.
+
+### `--stop` / `--stop-docker`
+
+Окремий режим — нічого не перегенеровує, лише знімає ланцюг `forward` із
+**живої** таблиці (`input`, усі сети й live-стан не чіпає). Взаємовиключний
+з `--reset-live-state`/`--no-docker` (це прапорці генерації, а `--stop*` її
+взагалі не запускає).
+
+Навіщо: `forward` із великою кількістю per-bridge правил (16 рівнів × dual
+stack × кожен bridge) заважає Docker чисто "гаситись" — daemon під час
+зупинки посилає купу netlink-подій на видалення бриджів/veth, і активний
+hook на `forward` це лише сповільнює. `--stop` знімає цей hook заздалегідь:
+
+```sh
+sudo nft-scan-detector --stop            # тільки зняти forward
+sudo nft-scan-detector --stop-docker     # зняти forward + systemctl stop docker.socket docker.service
+```
+
+`--stop-docker` зупиняє спершу `docker.socket`, потім `docker.service` (у
+цьому порядку — інакше socket-activation підніме `docker.service` назад
+щойно хтось звернеться до сокета). Щоб повернути `forward` — достатньо
+звичайного запуску `nft-scan-detector` (без `--stop*`) після того, як Docker
+знову працює.
+
+## Автопідхоплення docker-мереж: `docker-network-watch`
+
+`nft-scan-detector` визначає список docker-бриджів один раз при запуску.
+Якщо ти рідко, але додаєш/прибираєш docker-мережі "на живу" — щоб новий
+bridge підхопився в `forward` без ручного рестарту сервісу, є окремий
+слухач подій Docker: `src/bash/docker-network-watch` +
+`systemd/docker-network-watch.service`.
+
+Як це працює: скрипт підписується на `docker events --filter type=network`
+(create/destroy), і на кожну таку подію викликає
+`systemctl restart scan-detector.service`. Live-стан каскаду переживає цей
+рестарт (див. `--reset-live-state` вище), тож рестарт нічого не коштує.
+Якщо кілька мереж з'являються одна за одною (напр. `docker compose up`
+одразу створює декілька) — вбудований дебаунс (2s тиші після останньої
+події) згортає серію в один рестарт, а не по одному на кожну мережу.
+
+Встановлення:
+
+```sh
+sudo install -m 755 src/bash/docker-network-watch /usr/local/sbin/docker-network-watch
+sudo install -m 644 systemd/docker-network-watch.service /etc/systemd/system/docker-network-watch.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now docker-network-watch.service
+```
+
+Юніт має `Requires=docker.service` — якщо Docker на хості явно зупинити
+(зокрема через `nft-scan-detector --stop-docker`), слухач зупиниться разом
+з ним, а не крутитиметься марно в `Restart=always`. Якщо на хості взагалі
+немає Docker — цей юніт не потрібен, не enable-ти його.
+
 ## Списки: trusted / ignore / permanentBlock
 
 - **trusted** — довірені джерела (напр. NOC-сервери), пропускаються (`return`) без обмежень.
@@ -137,23 +237,9 @@ override-файл у `/etc/nft-scandetect/`:
 
 ## Відомі обмеження і TODO
 
-- **Live-стан скидається при кожному запуску `nft-scan-detector`.** Скрипт
-  робить `delete table` + повне перестворення, тобто `scan`/`level*`/`srv_*`
-  (усе, що накопичив детектор про поточних "підозрюваних") зникає разом з
-  таблицею. Це прийнятно, поки скрипт запускається один раз при старті системи,
-  і свідомо залишено як є — логіка живе 10+ років і поки не готова до
-  кардинальної переробки. Якщо колись знадобиться періодичний перезапуск
-  (напр. для підхоплення нових docker-мереж без ребута) — знадобиться
-  зберігати/відновлювати live-стан або переходити на інкрементальне
-  застосування без `delete table`.
-- **Немає автоматичного підхоплення нових docker-мереж без перезапуску
-  сервісу.** Зараз список bridge-інтерфейсів визначається один раз при
-  запуску `nft-scan-detector`. Планується systemd-timer або docker
-  event-хук, який рестартує сервіс при появі/зникненні docker-мережі —
-  з урахуванням обмеження вище.
-- **Опціональне від'єднання від Docker.** Прапорець/env-змінна, що вимикає
-  генерацію `forward`-правил і залишає лише `input` — для хостів без Docker
-  або де docker-мережі захищаються інакше.
+Наразі суттєвих відкритих обмежень нема — автопідхоплення docker-мереж
+закрито `docker-network-watch` (вище), зупинка перед вимкненням Docker —
+`--stop`/`--stop-docker`, live-стан переживає будь-який із цих рестартів.
 
 ## Ліцензія
 
