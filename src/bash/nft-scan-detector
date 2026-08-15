@@ -63,8 +63,9 @@ OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
 RESET_LIVE_STATE=0
 NO_DOCKER=0
-STOP=0
-STOP_DOCKER=0
+STOP_FWD=0
+STOP_FWD_DOCKER=0
+STOP_ALL=0
 INIT=0
 LIVE_STATE_FILE=""
 SRV_PORT_GROUPS=""
@@ -100,10 +101,12 @@ DEFAULT_PRIORITY=-50
 usage() {
     cat <<EOF
 Використання: $(basename "$0") [--reset-live-state] [--no-docker]
-       $(basename "$0") --stop | --stop-docker
+       $(basename "$0") --stop-fwd | --stop-fwd-docker
+       $(basename "$0") --stop
        $(basename "$0") --init
 
-Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без --stop*/--init:
+Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без окремих
+режимів нижче (--stop-fwd*/--stop/--init):
 
   --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
                         (стара поведінка: суцільний delete table без
@@ -115,15 +118,23 @@ usage() {
                         якщо бінарника docker немає на хості. Незалежний від
                         --reset-live-state -- прапорці вільно комбінуються.
 
---stop / --stop-docker -- окремий режим, нічого не перегенеровує, а лише
-знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не чіпає).
-Корисно перед зупинкою Docker -- forward з великою кількістю per-bridge
-правил заважає docker чисто "гаситись". Щоб повернути forward -- достатньо
-звичайного запуску без --stop*. Взаємовиключні з --reset-live-state/--no-docker.
+--stop-fwd / --stop-fwd-docker -- окремий режим, нічого не перегенеровує, а
+лише знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не
+чіпає). Корисно перед зупинкою Docker -- forward з великою кількістю
+per-bridge правил заважає docker чисто "гаситись". Щоб повернути forward --
+достатньо звичайного запуску без окремих режимів.
 
-  --stop                Зняти ланцюг forward, більше нічого не робити.
-  --stop-docker          Те саме, що --stop, і додатково зупинити
+  --stop-fwd            Зняти ланцюг forward, більше нічого не робити.
+  --stop-fwd-docker      Те саме, що --stop-fwd, і додатково зупинити
                         docker.socket та docker.service (у цьому порядку).
+
+--stop -- прибирає ${TABLE} із системи ПОВНІСТЮ (delete table: і input, і
+forward, і всі сети/live-стан). Хост і docker-мережі після цього нічим не
+захищені. Щоб повернути -- звичайний запуск (live-стан за час "простою"
+втрачається).
+
+  --stop                Повністю видалити таблицю ${TABLE}, більше нічого
+                        не робити.
 
 --init -- ще один окремий режим: лише сіє всі override-файли в
 ${OVERRIDE_DIR} вбудованими дефолтами, якщо їх ще нема (ті самі
@@ -140,29 +151,37 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --reset-live-state) RESET_LIVE_STATE=1; shift ;;
         --no-docker) NO_DOCKER=1; shift ;;
-        --stop) STOP=1; shift ;;
-        --stop-docker) STOP=1; STOP_DOCKER=1; shift ;;
+        --stop-fwd) STOP_FWD=1; shift ;;
+        --stop-fwd-docker) STOP_FWD=1; STOP_FWD_DOCKER=1; shift ;;
+        --stop) STOP_ALL=1; shift ;;
         --init) INIT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
     esac
 done
 
-if [[ $STOP -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 || $INIT -eq 1 ) ]]; then
-    echo "Помилка: --stop/--stop-docker не можна комбінувати з --reset-live-state/--no-docker/--init." >&2
+# --stop-fwd*/--stop/--init -- окремі режими: рівно один з них максимум, і
+# жоден не комбінується з build-модифікаторами (--reset-live-state/--no-docker)
+STANDALONE_MODES=0
+[[ $STOP_FWD -eq 1 ]] && STANDALONE_MODES=$((STANDALONE_MODES + 1))
+[[ $STOP_ALL -eq 1 ]] && STANDALONE_MODES=$((STANDALONE_MODES + 1))
+[[ $INIT -eq 1 ]]     && STANDALONE_MODES=$((STANDALONE_MODES + 1))
+
+if [[ $STANDALONE_MODES -gt 1 ]]; then
+    echo "Помилка: --stop-fwd*/--stop/--init взаємовиключні між собою." >&2
     exit 1
 fi
 
-if [[ $INIT -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
-    echo "Помилка: --init не можна комбінувати з --reset-live-state/--no-docker." >&2
+if [[ $STANDALONE_MODES -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
+    echo "Помилка: --stop-fwd*/--stop/--init не можна комбінувати з --reset-live-state/--no-docker." >&2
     exit 1
 fi
 
 # Docker відсутній на хості (не лише daemon недоступний, а самого бінарника
 # нема) -- це стала, а не тимчасова умова, тож --no-docker вмикається сама
-# собою, без потреби пам'ятати про прапорець. У режимі --stop*/--init це не
-# має значення -- взагалі не чіпаємо docker тут.
-if [[ $STOP -eq 0 && $INIT -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
+# собою, без потреби пам'ятати про прапорець. В окремих режимах це не має
+# значення -- взагалі не чіпаємо docker тут.
+if [[ $STANDALONE_MODES -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
     echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
     NO_DOCKER=1
 fi
@@ -638,12 +657,12 @@ build_ruleset() {
     return 0
 }
 
-# --- --stop / --stop-docker ---
+# --- --stop-fwd / --stop-fwd-docker ---
 
 # Атомарно знімає ланцюг forward із ЖИВОЇ таблиці (окрема мінітранзакція,
 # теж через nft -c -f -> nft -f) -- input, усі сети й live-стан не чіпає.
 # Щоб повернути forward -- достатньо звичайного запуску nft-scan-detector.
-do_stop() {
+do_stop_fwd() {
     if ! sudo nft list chain ${TABLE} forward >/dev/null 2>&1; then
         echo "Ланцюг forward відсутній -- нічого знімати." >&2
         return 0
@@ -669,6 +688,36 @@ do_stop_docker() {
     echo "socket-activation не підняла docker.service назад)..." >&2
     sudo systemctl stop docker.socket
     sudo systemctl stop docker.service
+}
+
+# --- --stop ---
+
+# Атомарно прибирає ${TABLE} із системи ПОВНІСТЮ (delete table -- і input, і
+# forward, і всі сети/live-стан ідуть разом з нею). На відміну від
+# do_stop_fwd, це залишає хост і docker-мережі зовсім без захисту
+# scanDetector-ом. Щоб повернути -- звичайний запуск nft-scan-detector
+# (перестворює таблицю з нуля, live-стан за час "простою" не відновити --
+# його просто нема, звідки брати).
+do_stop_all() {
+    if ! sudo nft list table ${TABLE} >/dev/null 2>&1; then
+        echo "Таблиця ${TABLE} відсутня -- нічого прибирати." >&2
+        return 0
+    fi
+
+    local tmpfile
+    tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
+    echo "delete table ${TABLE}" > "$tmpfile"
+
+    echo "Прибираю таблицю ${TABLE} із системи повністю..." >&2
+    if ! sudo nft -c -f "$tmpfile"; then
+        echo "Помилка синтаксису під час видалення таблиці -- нічого не чіпаю." >&2
+        rm -f "$tmpfile"
+        exit 1
+    fi
+    sudo nft -f "$tmpfile"
+    rm -f "$tmpfile"
+    echo "Таблицю ${TABLE} прибрано. Хост і docker-мережі БІЛЬШЕ НЕ захищені scanDetector-ом." >&2
+    echo "Щоб повернути -- звичайний запуск nft-scan-detector." >&2
 }
 
 # --- --init ---
@@ -710,9 +759,14 @@ main() {
     sudo nft list table ${TABLE}
 }
 
-if [[ $STOP -eq 1 ]]; then
-    do_stop
-    [[ $STOP_DOCKER -eq 1 ]] && do_stop_docker
+if [[ $STOP_FWD -eq 1 ]]; then
+    do_stop_fwd
+    [[ $STOP_FWD_DOCKER -eq 1 ]] && do_stop_docker
+    exit 0
+fi
+
+if [[ $STOP_ALL -eq 1 ]]; then
+    do_stop_all
     exit 0
 fi
 
