@@ -74,6 +74,10 @@ SRV_PORT_GROUPS=""
 LEVEL_TIMEOUTS=(3h 2h30m 2h 1h30m 1h 50m 40m 30m 20m 15m 10m 5m 4m 3m 2m 1m)
 LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
 
+# scan/scan6 -- фінальний блок після найдовшого рівня (level0/level6_0),
+# перевизначається опційним рядком "scan:timeout" у level_timeouts
+DEFAULT_SCAN_TIMEOUT=31d
+
 # srv_* сети: назва -> таймаут
 SRV_STAGES=(normal:5s check0:10s check1:15s block:1m)
 
@@ -259,47 +263,76 @@ seed_level_timeouts_if_missing() {
         echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
         echo "# Формат: N:timeout, по одному рядку, суцільно від 0 без пропусків/дублів."
         echo "# Кількість рядків = кількість рівнів ескалації (level0..levelN / level6_0..level6_N)."
+        echo "# Додатково -- щонайбільше один рядок scan:timeout: таймаут фінального"
+        echo "# блоку scan/scan6 (куди потрапляють після найдовшого рівня, level0)."
         local i
         for i in "${!LEVEL_TIMEOUTS[@]}"; do
             echo "${i}:${LEVEL_TIMEOUTS[$i]}"
         done
+        echo "scan:${DEFAULT_SCAN_TIMEOUT}"
     } | sudo tee "$file" >/dev/null
 }
 
-# Перевіряє, що LINES -- це рядки "N:timeout", суцільні від 0 без
-# пропусків/дублів (незалежно від порядку рядків у файлі).
+# Перевіряє, що LINES -- це рядки "N:timeout" (суцільні від 0 без
+# пропусків/дублів, порядок рядків у файлі не важливий) плюс щонайбільше
+# один додатковий рядок "scan:timeout".
 validate_level_timeouts() {
-    local lines="$1" line idx expected=0
+    local lines="$1" line idx expected=0 scan_seen=0
     [[ -z "$lines" ]] && return 1
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        [[ "$line" =~ ^[0-9]+:[^:[:space:]]+$ ]] || return 1
+        if [[ "$line" == scan:* ]]; then
+            [[ "$line" =~ ^scan:[^:[:space:]]+$ ]] || return 1
+            [[ $scan_seen -eq 1 ]] && return 1
+            scan_seen=1
+        else
+            [[ "$line" =~ ^[0-9]+:[^:[:space:]]+$ ]] || return 1
+        fi
     done <<< "$lines"
     while IFS= read -r idx; do
         idx="${idx%%:*}"
         [[ "$idx" -eq "$expected" ]] || return 1
         expected=$((expected + 1))
-    done < <(printf '%s\n' "$lines" | sort -t: -k1,1n)
+    done < <(printf '%s\n' "$lines" | grep -v '^scan:' | sort -t: -k1,1n)
     return 0
 }
 
 # Читає й валідує ${OVERRIDE_DIR}/level_timeouts, друкує ефективні "N:timeout"
-# по рядку, відсортовані за N. Невалідний формат чи відсутній файл --
-# попередження в stderr і вбудований дефолт (поточний LEVEL_TIMEOUTS).
+# по рядку (без "scan:"), відсортовані за N. Невалідний формат чи відсутній
+# файл -- попередження в stderr і вбудований дефолт (поточний LEVEL_TIMEOUTS).
 read_level_timeouts() {
     local file="${OVERRIDE_DIR}/level_timeouts" lines
     if [[ -f "$file" ]]; then
         lines=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
         if validate_level_timeouts "$lines"; then
-            printf '%s\n' "$lines" | sort -t: -k1,1n
+            printf '%s\n' "$lines" | grep -v '^scan:' | sort -t: -k1,1n
             return 0
         fi
-        echo "УВАГА: $file має невалідний формат (потрібні суцільні рядки N:timeout від 0 без пропусків/дублів) -- використовую вбудований дефолт." >&2
+        echo "УВАГА: $file має невалідний формат (потрібні суцільні рядки N:timeout від 0 без пропусків/дублів, і щонайбільше один рядок scan:timeout) -- використовую вбудований дефолт." >&2
     fi
     local i
     for i in "${!LEVEL_TIMEOUTS[@]}"; do
         echo "${i}:${LEVEL_TIMEOUTS[$i]}"
     done
+}
+
+# Читає той самий level_timeouts і повертає лише таймаут scan/scan6 --
+# рядок "scan:timeout", якщо є й валідний, інакше DEFAULT_SCAN_TIMEOUT.
+# Попередження про невалідний файл друкує read_level_timeouts (викликається
+# поруч у build_ruleset) -- тут вдруге не дублюємо.
+read_scan_timeout() {
+    local file="${OVERRIDE_DIR}/level_timeouts" lines scan_line
+    if [[ -f "$file" ]]; then
+        lines=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
+        if validate_level_timeouts "$lines"; then
+            scan_line=$(printf '%s\n' "$lines" | grep '^scan:' || true)
+            if [[ -n "$scan_line" ]]; then
+                echo "${scan_line#scan:}"
+                return 0
+            fi
+        fi
+    fi
+    echo "$DEFAULT_SCAN_TIMEOUT"
 }
 
 seed_srv_ports_if_missing() {
@@ -558,7 +591,7 @@ build_ruleset() {
     # ефективна драбина рівнів -- з level_timeouts, якщо валідний, інакше
     # вбудований дефолт; gen_level_sets/gen_level_rules нижче далі просто
     # читають LEVEL_TIMEOUTS/LAST_LEVEL, змін у них не треба
-    local level_lines lt_line lt_idx
+    local level_lines lt_line lt_idx scan_timeout
     level_lines=$(read_level_timeouts)
     LEVEL_TIMEOUTS=()
     while IFS= read -r lt_line; do
@@ -567,6 +600,7 @@ build_ruleset() {
         LEVEL_TIMEOUTS[lt_idx]="${lt_line#*:}"
     done <<< "$level_lines"
     LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))
+    scan_timeout=$(read_scan_timeout)
 
     # ефективні таймаути стадій srv_* -- аналогічно, gen_srv_sets змін не потребує
     local srv_lines st_line
@@ -616,10 +650,10 @@ build_ruleset() {
 
     # --- level0..level15 / level6_0..level6_15 ---
     gen_level_sets ipv4_addr level
-    echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
     emit_restore "scan"
     gen_level_sets ipv6_addr level6_
-    echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout 31d; comment \"Scan Detect\"; }"
+    echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
     emit_restore "scan6"
 
     # --- ланцюги ---
