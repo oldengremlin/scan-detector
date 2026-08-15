@@ -41,6 +41,20 @@
 # (дефолт -50). Нелегітимне значення чи відсутній файл — фолбек на дефолт із
 # попередженням у stderr. Керується вручну або через
 # `scan-detect-tool --set-priority N`.
+#
+# /etc/nft-scandetect/level_timeouts — рядки "N:timeout", СУЦІЛЬНО від 0 без
+# пропусків/дублів (кількість рядків = кількість рівнів ескалації
+# level0..levelN / level6_0..level6_N). Невалідний формат — фолбек на
+# вбудований дефолт (16 рівнів, як завжди) з попередженням у stderr.
+#
+# /etc/nft-scandetect/srv_ports — рядки "proto/port" (tcp або udp), захищені
+# порти для каскаду srv_*/srv6_* (дефолт tcp/80, tcp/443). Кілька портів
+# одного протоколу йдуть в один dport-матч; usі протоколи пишуть у ТІ САМІ
+# сети normal/check0/check1/block (throttle по saddr, не по протоколу).
+#
+# /etc/nft-scandetect/srv_timeouts — рядки "stage:timeout", рівно 4 стадії:
+# normal, check0, check1, block (дефолт 5s/10s/15s/1m). Неповний набір чи
+# невідома стадія — фолбек на дефолт з попередженням у stderr.
 
 set -euo pipefail
 
@@ -52,6 +66,7 @@ NO_DOCKER=0
 STOP=0
 STOP_DOCKER=0
 LIVE_STATE_FILE=""
+SRV_PORT_GROUPS=""
 
 # level0 = найдовший таймаут (найтерплячіший), level15 = найкоротший (щойно спіймали)
 LEVEL_TIMEOUTS=(3h 2h30m 2h 1h30m 1h 50m 40m 30m 20m 15m 10m 5m 4m 3m 2m 1m)
@@ -59,6 +74,9 @@ LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
 
 # srv_* сети: назва -> таймаут
 SRV_STAGES=(normal:5s check0:10s check1:15s block:1m)
+
+# захищені порти для каскаду srv_*/srv6_* (те, що зараз "tcp dport { 80, 443 }")
+SRV_PORTS_DEFAULT=(tcp/80 tcp/443)
 
 # "Заводські" дефолти — застосовуються ТІЛЬКИ якщо відповідного
 # override-файлу ще нема на диску (перший запуск / чиста система).
@@ -198,6 +216,146 @@ read_priority() {
     echo "$DEFAULT_PRIORITY"
 }
 
+seed_level_timeouts_if_missing() {
+    local file="${OVERRIDE_DIR}/level_timeouts"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    {
+        echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
+        echo "# Формат: N:timeout, по одному рядку, суцільно від 0 без пропусків/дублів."
+        echo "# Кількість рядків = кількість рівнів ескалації (level0..levelN / level6_0..level6_N)."
+        local i
+        for i in "${!LEVEL_TIMEOUTS[@]}"; do
+            echo "${i}:${LEVEL_TIMEOUTS[$i]}"
+        done
+    } | sudo tee "$file" >/dev/null
+}
+
+# Перевіряє, що LINES -- це рядки "N:timeout", суцільні від 0 без
+# пропусків/дублів (незалежно від порядку рядків у файлі).
+validate_level_timeouts() {
+    local lines="$1" line idx expected=0
+    [[ -z "$lines" ]] && return 1
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^[0-9]+:[^:[:space:]]+$ ]] || return 1
+    done <<< "$lines"
+    while IFS= read -r idx; do
+        idx="${idx%%:*}"
+        [[ "$idx" -eq "$expected" ]] || return 1
+        expected=$((expected + 1))
+    done < <(printf '%s\n' "$lines" | sort -t: -k1,1n)
+    return 0
+}
+
+# Читає й валідує ${OVERRIDE_DIR}/level_timeouts, друкує ефективні "N:timeout"
+# по рядку, відсортовані за N. Невалідний формат чи відсутній файл --
+# попередження в stderr і вбудований дефолт (поточний LEVEL_TIMEOUTS).
+read_level_timeouts() {
+    local file="${OVERRIDE_DIR}/level_timeouts" lines
+    if [[ -f "$file" ]]; then
+        lines=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
+        if validate_level_timeouts "$lines"; then
+            printf '%s\n' "$lines" | sort -t: -k1,1n
+            return 0
+        fi
+        echo "УВАГА: $file має невалідний формат (потрібні суцільні рядки N:timeout від 0 без пропусків/дублів) -- використовую вбудований дефолт." >&2
+    fi
+    local i
+    for i in "${!LEVEL_TIMEOUTS[@]}"; do
+        echo "${i}:${LEVEL_TIMEOUTS[$i]}"
+    done
+}
+
+seed_srv_ports_if_missing() {
+    local file="${OVERRIDE_DIR}/srv_ports"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    {
+        echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
+        echo "# Формат: proto/port, по одному рядку (proto: tcp або udp)."
+        printf '%s\n' "${SRV_PORTS_DEFAULT[@]}"
+    } | sudo tee "$file" >/dev/null
+}
+
+# Читає ${OVERRIDE_DIR}/srv_ports, групує по протоколу, друкує
+# "proto:port1,port2,..." по рядку (один рядок на протокол). Невалідні окремі
+# рядки пропускаються з попередженням; якщо після фільтрації не лишилось
+# жодного валідного порту -- вбудований дефолт (SRV_PORTS_DEFAULT).
+read_srv_port_groups() {
+    local file="${OVERRIDE_DIR}/srv_ports" raw="" line proto port
+    local -A by_proto=()
+
+    [[ -f "$file" ]] && raw=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
+    [[ -z "$raw" ]] && raw=$(printf '%s\n' "${SRV_PORTS_DEFAULT[@]}")
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^(tcp|udp)/([0-9]{1,5})$ ]]; then
+            proto="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+            if (( port >= 1 && port <= 65535 )); then
+                by_proto[$proto]+="${by_proto[$proto]:+,}${port}"
+                continue
+            fi
+        fi
+        echo "УВАГА: '$line' у ${OVERRIDE_DIR}/srv_ports не схоже на proto/port (tcp|udp/1..65535) -- пропускаю." >&2
+    done <<< "$raw"
+
+    if [[ ${#by_proto[@]} -eq 0 ]]; then
+        echo "УВАГА: жодного валідного proto/port у ${OVERRIDE_DIR}/srv_ports -- використовую вбудований дефолт." >&2
+        local d
+        for d in "${SRV_PORTS_DEFAULT[@]}"; do
+            proto="${d%%/*}"; port="${d##*/}"
+            by_proto[$proto]+="${by_proto[$proto]:+,}${port}"
+        done
+    fi
+
+    local p
+    for p in "${!by_proto[@]}"; do
+        echo "${p}:${by_proto[$p]}"
+    done
+}
+
+seed_srv_timeouts_if_missing() {
+    local file="${OVERRIDE_DIR}/srv_timeouts"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    {
+        echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
+        echo "# Формат: stage:timeout, рівно 4 стадії: normal, check0, check1, block."
+        printf '%s\n' "${SRV_STAGES[@]}"
+    } | sudo tee "$file" >/dev/null
+}
+
+# Перевіряє, що LINES -- це рядки "stage:timeout", де stage -- рівно
+# normal/check0/check1/block, кожна один раз (порядок не важливий).
+validate_srv_timeouts() {
+    local lines="$1" line
+    local -A seen=()
+    [[ -z "$lines" ]] && return 1
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^(normal|check0|check1|block):[^:[:space:]]+$ ]] || return 1
+        local stage="${line%%:*}"
+        [[ -n "${seen[$stage]:-}" ]] && return 1
+        seen[$stage]=1
+    done <<< "$lines"
+    [[ ${#seen[@]} -eq 4 ]]
+}
+
+read_srv_timeouts() {
+    local file="${OVERRIDE_DIR}/srv_timeouts" lines
+    if [[ -f "$file" ]]; then
+        lines=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
+        if validate_srv_timeouts "$lines"; then
+            printf '%s\n' "$lines"
+            return 0
+        fi
+        echo "УВАГА: $file невалідний (потрібні рівно 4 стадії: normal/check0/check1/block, кожна один раз) -- використовую вбудований дефолт." >&2
+    fi
+    printf '%s\n' "${SRV_STAGES[@]}"
+}
+
 # Знімає елементи всіх dynamic/timeout сетів живої таблиці (scan/level*/srv_*
 # та їхні IPv6-відповідники) разом із рештою таймауту -- у $LIVE_STATE_FILE,
 # по рядку "назва_сету<TAB>значення<TAB>решта_секунд". Статичних interval-сетів
@@ -277,15 +435,31 @@ gen_srv_sets() {
 }
 
 gen_srv_rules() {
-    # gen_srv_rules CHAIN PROTO PREFIX IFACE_MATCH
-    local chain="$1" proto="$2" prefix="$3" ifm="${4:-}"
+    # gen_srv_rules CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
+    # L4MATCH -- напр. "tcp dport { 80, 443 }"; кілька L4MATCH можуть ділити
+    # ті самі normal/check0/check1/block (throttle по saddr, не по протоколу)
+    local chain="$1" proto="$2" prefix="$3" l4match="$4" ifm="${5:-}"
     local normal="${prefix}normal" c0="${prefix}check0" c1="${prefix}check1" block="${prefix}block"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c1} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr != @${normal} add @${normal} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
-    echo "add rule ${TABLE} ${chain} ${ifm}tcp dport { 80, 443 } ct state new ${proto} saddr @${normal} counter return"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${normal} add @${normal} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${normal} counter return"
+}
+
+# gen_srv_rules_all_ports CHAIN PROTO PREFIX IFACE_MATCH -- викликає
+# gen_srv_rules по разу на кожну протокол-групу з $SRV_PORT_GROUPS
+# ("proto:port1,port2" по рядку, див. read_srv_port_groups).
+gen_srv_rules_all_ports() {
+    local chain="$1" proto="$2" prefix="$3" ifm="${4:-}"
+    local group l4proto ports
+    while IFS= read -r group; do
+        [[ -z "$group" ]] && continue
+        l4proto="${group%%:*}"
+        ports="${group#*:}"
+        gen_srv_rules "$chain" "$proto" "$prefix" "${l4proto} dport { ${ports} }" "$ifm"
+    done <<< "$SRV_PORT_GROUPS"
 }
 
 gen_level_rules() {
@@ -333,9 +507,37 @@ build_ruleset() {
     seed_if_missing "${OVERRIDE_DIR}/ignore6-extra.list"    "$BASE_IGNORE6"
     seed_if_missing "${OVERRIDE_DIR}/permanent6-extra.list" "$BASE_PERMANENT6"
     seed_priority_if_missing
+    seed_level_timeouts_if_missing
+    seed_srv_ports_if_missing
+    seed_srv_timeouts_if_missing
 
     local trusted ignore permanent trusted6 ignore6 permanent6 priority
     priority=$(read_priority)
+
+    # ефективна драбина рівнів -- з level_timeouts, якщо валідний, інакше
+    # вбудований дефолт; gen_level_sets/gen_level_rules нижче далі просто
+    # читають LEVEL_TIMEOUTS/LAST_LEVEL, змін у них не треба
+    local level_lines lt_line lt_idx
+    level_lines=$(read_level_timeouts)
+    LEVEL_TIMEOUTS=()
+    while IFS= read -r lt_line; do
+        [[ -z "$lt_line" ]] && continue
+        lt_idx="${lt_line%%:*}"
+        LEVEL_TIMEOUTS[lt_idx]="${lt_line#*:}"
+    done <<< "$level_lines"
+    LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))
+
+    # ефективні таймаути стадій srv_* -- аналогічно, gen_srv_sets змін не потребує
+    local srv_lines st_line
+    srv_lines=$(read_srv_timeouts)
+    SRV_STAGES=()
+    while IFS= read -r st_line; do
+        [[ -z "$st_line" ]] && continue
+        SRV_STAGES+=("$st_line")
+    done <<< "$srv_lines"
+
+    # ефективні захищені порти, згруповані по протоколу -- для gen_srv_rules_all_ports
+    SRV_PORT_GROUPS=$(read_srv_port_groups)
 
     trusted=$(list_elements    "$BASE_TRUSTED"    "${OVERRIDE_DIR}/trusted-extra.list")
     ignore=$(list_elements     "$BASE_IGNORE"     "${OVERRIDE_DIR}/ignore-extra.list")
@@ -384,12 +586,12 @@ build_ruleset() {
 
     # --- input: ipv4 ---
     gen_static_guard_rules input
-    gen_srv_rules input ip srv_
+    gen_srv_rules_all_ports input ip srv_
     gen_level_rules input ip level scan
 
     # --- input: ipv6 ---
     gen_static_guard6_rules input
-    gen_srv_rules input ip6 srv6_
+    gen_srv_rules_all_ports input ip6 srv6_
     gen_level_rules input ip6 level6_ scan6
 
     # --- forward: тільки якщо Docker не вимкнено -- інакше ланцюга forward
@@ -404,11 +606,11 @@ build_ruleset() {
         ifm="iifname != ${iface} oifname ${iface} "
 
         gen_static_guard_rules forward "$ifm"
-        gen_srv_rules forward ip srv_ "$ifm"
+        gen_srv_rules_all_ports forward ip srv_ "$ifm"
         gen_level_rules forward ip level scan "$ifm"
 
         gen_static_guard6_rules forward "$ifm"
-        gen_srv_rules forward ip6 srv6_ "$ifm"
+        gen_srv_rules_all_ports forward ip6 srv6_ "$ifm"
         gen_level_rules forward ip6 level6_ scan6 "$ifm"
     done < <(get_docker_bridges)
     return 0
