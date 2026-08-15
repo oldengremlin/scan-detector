@@ -35,6 +35,12 @@
 #   /etc/nft-scandetect/trusted6-extra.list
 #   /etc/nft-scandetect/ignore6-extra.list
 #   /etc/nft-scandetect/permanent6-extra.list
+#
+# /etc/nft-scandetect/priority — окремий формат: РІВНО одне ціле число,
+# без коментарів (читається через `head -1`). Пріоритет hook'ів input/forward
+# (дефолт -50). Нелегітимне значення чи відсутній файл — фолбек на дефолт із
+# попередженням у stderr. Керується вручну або через
+# `scan-detect-tool --set-priority N`.
 
 set -euo pipefail
 
@@ -64,6 +70,11 @@ BASE_PERMANENT=""
 BASE_IGNORE6="fe80::/64"
 BASE_TRUSTED6="::1/128"
 BASE_PERMANENT6=""
+
+# Пріоритет hook'ів input/forward. Перевизначається файлом
+# ${OVERRIDE_DIR}/priority (одне ціле число, керується вручну або через
+# `scan-detect-tool --set-priority`) -- див. read_priority нижче.
+DEFAULT_PRIORITY=-50
 
 # ---------------------------------------------------------------------------
 
@@ -158,6 +169,33 @@ seed_if_missing() {
             echo "$base_default" | tr ',' '\n' | sed 's/^ *//; s/ *$//'
         fi
     } | sudo tee "$file" >/dev/null
+}
+
+# ${OVERRIDE_DIR}/priority -- рівно одне ціле число, без коментарів (щоб
+# read_priority міг обмежитись `head -1` і не парсити весь файл заради
+# єдиного значення).
+seed_priority_if_missing() {
+    local file="${OVERRIDE_DIR}/priority"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    echo "$DEFAULT_PRIORITY" | sudo tee "$file" >/dev/null
+}
+
+# Читає й валідує пріоритет з ${OVERRIDE_DIR}/priority. Нелегітимне значення
+# (не ціле число) чи відсутній файл -- тихо (з попередженням у stderr) падає
+# на DEFAULT_PRIORITY, а не ламає весь ruleset.
+read_priority() {
+    local file="${OVERRIDE_DIR}/priority" raw
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file")
+        raw="${raw//[[:space:]]/}"
+        if [[ "$raw" =~ ^-?[0-9]+$ ]]; then
+            echo "$raw"
+            return 0
+        fi
+        echo "УВАГА: $file містить нелегітимне значення пріоритету ('$raw') -- використовую дефолт ${DEFAULT_PRIORITY}." >&2
+    fi
+    echo "$DEFAULT_PRIORITY"
 }
 
 # Знімає елементи всіх dynamic/timeout сетів живої таблиці (scan/level*/srv_*
@@ -294,8 +332,10 @@ build_ruleset() {
     seed_if_missing "${OVERRIDE_DIR}/trusted6-extra.list"   "$BASE_TRUSTED6"
     seed_if_missing "${OVERRIDE_DIR}/ignore6-extra.list"    "$BASE_IGNORE6"
     seed_if_missing "${OVERRIDE_DIR}/permanent6-extra.list" "$BASE_PERMANENT6"
+    seed_priority_if_missing
 
-    local trusted ignore permanent trusted6 ignore6 permanent6
+    local trusted ignore permanent trusted6 ignore6 permanent6 priority
+    priority=$(read_priority)
 
     trusted=$(list_elements    "$BASE_TRUSTED"    "${OVERRIDE_DIR}/trusted-extra.list")
     ignore=$(list_elements     "$BASE_IGNORE"     "${OVERRIDE_DIR}/ignore-extra.list")
@@ -340,7 +380,7 @@ build_ruleset() {
     emit_restore "scan6"
 
     # --- ланцюги ---
-    echo "add chain ${TABLE} input { type filter hook input priority -50; }"
+    echo "add chain ${TABLE} input { type filter hook input priority ${priority}; }"
 
     # --- input: ipv4 ---
     gen_static_guard_rules input
@@ -356,7 +396,7 @@ build_ruleset() {
     # у таблиці взагалі нема, і hook forward цю таблицю не чіпає
     [[ $NO_DOCKER -eq 1 ]] && return 0
 
-    echo "add chain ${TABLE} forward { type filter hook forward priority -50; }"
+    echo "add chain ${TABLE} forward { type filter hook forward priority ${priority}; }"
 
     local iface ifm
     while read -r iface; do
