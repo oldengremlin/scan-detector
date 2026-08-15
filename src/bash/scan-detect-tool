@@ -19,6 +19,9 @@
 #   scan-detect-tool --add-trusted IP      додати в trusted/trusted6
 #   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
 #   scan-detect-tool --list IP             показати живі сети + override-файли, де є IP
+#   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
+#                                           (застосовується рестартом scan-detector.service,
+#                                           не "живим" add element)
 #   scan-detect-tool --dry-run ...         показати команди, нічого не змінюючи
 #
 # Вимоги: nft, jq
@@ -32,7 +35,7 @@ DRY_RUN=0
 
 usage() {
     cat <<EOF
-Використання: $(basename "$0") [--dry-run] КОМАНДА IP
+Використання: $(basename "$0") [--dry-run] КОМАНДА АРГУМЕНТ
 
 Команди:
   --delete IP           Видалити IP з усіх живих сетів і з усіх override-файлів,
@@ -41,6 +44,10 @@ usage() {
   --add-trusted IP       Додати IP в trusted (trusted6 для IPv6)
   --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
   --list IP              Показати живі сети та override-файли, де присутній IP
+  --set-priority N       Перевизначити пріоритет hook'ів input/forward (ціле
+                         число, дефолт -50). На відміну від інших команд
+                         застосовується не одразу в живих сетах, а рестартом
+                         scan-detector.service (потрібна повна перегенерація).
 
 Опції:
   --dry-run              Показати команди/дії, нічого не застосовуючи
@@ -265,25 +272,60 @@ cmd_add() {
         || echo "УВАГА: не вдалось застосувати наживо (таблиця/сет ще не створені? запустіть nft-scan-detector)." >&2
 }
 
+# cmd_set_priority VALUE -- перевизначає пріоритет hook'ів input/forward
+# (${OVERRIDE_DIR}/priority, керується так само nft-scan-detector'ом --
+# див. read_priority там). На відміну від --add-*, це не "живий" add
+# element: пріоритет міняє сам hook, застосувати можна лише повною
+# перегенерацією ruleset, тож тут -- рестарт scan-detector.service.
+cmd_set_priority() {
+    local raw="$1" value file
+    value="${raw//[[:space:]]/}"
+    if [[ ! "$value" =~ ^-?[0-9]+$ ]]; then
+        echo "Помилка: '$raw' не схоже на ціле число (пріоритет хука)." >&2
+        exit 1
+    fi
+    file="${OVERRIDE_DIR}/priority"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) echo '$value' > $file"
+        echo "(dry-run) systemctl restart scan-detector.service"
+        return 0
+    fi
+
+    sudo mkdir -p "$OVERRIDE_DIR"
+    echo "$value" | sudo tee "$file" >/dev/null
+    echo "Пріоритет збережено: $value ($file)."
+
+    echo "Пріоритет міняє сам hook -- застосовується лише повною перегенерацією." >&2
+    echo "Рестартую scan-detector.service..." >&2
+    if sudo systemctl restart scan-detector.service 2>/dev/null; then
+        echo "Застосовано."
+    else
+        echo "УВАГА: не вдалось перезапустити scan-detector.service -- застосуйте вручну: sudo nft-scan-detector" >&2
+    fi
+}
+
 # --- разбір аргументів ---
 
 [[ $# -eq 0 ]] && usage
 
 ACTION=""
-IP=""
+ARG=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --delete)
-            ACTION="delete"; IP="${2:-}"; shift 2 ;;
+            ACTION="delete"; ARG="${2:-}"; shift 2 ;;
         --add-ignore)
-            ACTION="add-ignore"; IP="${2:-}"; shift 2 ;;
+            ACTION="add-ignore"; ARG="${2:-}"; shift 2 ;;
         --add-trusted)
-            ACTION="add-trusted"; IP="${2:-}"; shift 2 ;;
+            ACTION="add-trusted"; ARG="${2:-}"; shift 2 ;;
         --add-permanent)
-            ACTION="add-permanent"; IP="${2:-}"; shift 2 ;;
+            ACTION="add-permanent"; ARG="${2:-}"; shift 2 ;;
         --list)
-            ACTION="list"; IP="${2:-}"; shift 2 ;;
+            ACTION="list"; ARG="${2:-}"; shift 2 ;;
+        --set-priority)
+            ACTION="set-priority"; ARG="${2:-}"; shift 2 ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         -h|--help)
@@ -294,8 +336,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$ACTION" || -z "$IP" ]]; then
-    echo "Помилка: не вказано команду або IP-адресу." >&2
+if [[ -z "$ACTION" || -z "$ARG" ]]; then
+    echo "Помилка: не вказано команду або аргумент (IP-адресу чи значення)." >&2
     usage
 fi
 
@@ -305,9 +347,10 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 case "$ACTION" in
-    delete)        cmd_delete "$IP" ;;
-    add-ignore)    cmd_add ignore    "$IP" ;;
-    add-trusted)   cmd_add trusted   "$IP" ;;
-    add-permanent) cmd_add permanent "$IP" ;;
-    list)          cmd_list "$IP" ;;
+    delete)        cmd_delete "$ARG" ;;
+    add-ignore)    cmd_add ignore    "$ARG" ;;
+    add-trusted)   cmd_add trusted   "$ARG" ;;
+    add-permanent) cmd_add permanent "$ARG" ;;
+    list)          cmd_list "$ARG" ;;
+    set-priority)  cmd_set_priority "$ARG" ;;
 esac
