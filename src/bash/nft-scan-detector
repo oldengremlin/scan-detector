@@ -65,6 +65,7 @@ RESET_LIVE_STATE=0
 NO_DOCKER=0
 STOP=0
 STOP_DOCKER=0
+INIT=0
 LIVE_STATE_FILE=""
 SRV_PORT_GROUPS=""
 
@@ -100,8 +101,9 @@ usage() {
     cat <<EOF
 Використання: $(basename "$0") [--reset-live-state] [--no-docker]
        $(basename "$0") --stop | --stop-docker
+       $(basename "$0") --init
 
-Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без --stop*:
+Звичайний режим (пере)генерує весь ruleset -- $(basename "$0") без --stop*/--init:
 
   --reset-live-state   Не зберігати live-стан -- почати з чистих сетів
                         (стара поведінка: суцільний delete table без
@@ -122,6 +124,14 @@ usage() {
   --stop                Зняти ланцюг forward, більше нічого не робити.
   --stop-docker          Те саме, що --stop, і додатково зупинити
                         docker.socket та docker.service (у цьому порядку).
+
+--init -- ще один окремий режим: лише сіє всі override-файли в
+${OVERRIDE_DIR} вбудованими дефолтами, якщо їх ще нема (ті самі
+seed_*_if_missing, що й перед звичайною генерацією). Живу таблицю,
+Docker, live-стан не чіпає -- зручно, щоб проінспектувати/поправити
+конфіги ДО першого реального запуску. Взаємовиключний з рештою прапорців.
+
+  --init                Тільки досіяти відсутні override-файли, вийти.
   -h, --help            Ця довідка
 EOF
 }
@@ -132,21 +142,27 @@ while [[ $# -gt 0 ]]; do
         --no-docker) NO_DOCKER=1; shift ;;
         --stop) STOP=1; shift ;;
         --stop-docker) STOP=1; STOP_DOCKER=1; shift ;;
+        --init) INIT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Невідома опція: $1" >&2; usage; exit 1 ;;
     esac
 done
 
-if [[ $STOP -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
-    echo "Помилка: --stop/--stop-docker не можна комбінувати з --reset-live-state/--no-docker." >&2
+if [[ $STOP -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 || $INIT -eq 1 ) ]]; then
+    echo "Помилка: --stop/--stop-docker не можна комбінувати з --reset-live-state/--no-docker/--init." >&2
+    exit 1
+fi
+
+if [[ $INIT -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
+    echo "Помилка: --init не можна комбінувати з --reset-live-state/--no-docker." >&2
     exit 1
 fi
 
 # Docker відсутній на хості (не лише daemon недоступний, а самого бінарника
 # нема) -- це стала, а не тимчасова умова, тож --no-docker вмикається сама
-# собою, без потреби пам'ятати про прапорець. У режимі --stop* це не має
-# значення -- взагалі не чіпаємо docker тут.
-if [[ $STOP -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
+# собою, без потреби пам'ятати про прапорець. У режимі --stop*/--init це не
+# має значення -- взагалі не чіпаємо docker тут.
+if [[ $STOP -eq 0 && $INIT -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
     echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
     NO_DOCKER=1
 fi
@@ -495,11 +511,11 @@ gen_static_guard6_rules() {
     echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip6 saddr @ignore6 counter return"
 }
 
-# --- побудова повного ruleset ---
-
-build_ruleset() {
-    # спершу сіємо файли, яких ще нема -- щоб /etc/nft-scandetect завжди
-    # відображав актуальний стан, а не приховані в коді дефолти
+# Сіє всі override-файли, яких ще нема, вбудованими дефолтами -- щоб
+# /etc/nft-scandetect завжди відображав актуальний стан, а не приховані в
+# коді дефолти. Спільна для build_ruleset (перед генерацією) і --init
+# (самостійно, без генерації) -- щоб не дублювати список викликів.
+seed_all_config_if_missing() {
     seed_if_missing "${OVERRIDE_DIR}/trusted-extra.list"    "$BASE_TRUSTED"
     seed_if_missing "${OVERRIDE_DIR}/ignore-extra.list"     "$BASE_IGNORE"
     seed_if_missing "${OVERRIDE_DIR}/permanent-extra.list"  "$BASE_PERMANENT"
@@ -510,6 +526,12 @@ build_ruleset() {
     seed_level_timeouts_if_missing
     seed_srv_ports_if_missing
     seed_srv_timeouts_if_missing
+}
+
+# --- побудова повного ruleset ---
+
+build_ruleset() {
+    seed_all_config_if_missing
 
     local trusted ignore permanent trusted6 ignore6 permanent6 priority
     priority=$(read_priority)
@@ -649,6 +671,15 @@ do_stop_docker() {
     sudo systemctl stop docker.service
 }
 
+# --- --init ---
+
+do_init() {
+    sudo mkdir -p "$OVERRIDE_DIR"
+    seed_all_config_if_missing
+    echo "Override-файли в ${OVERRIDE_DIR} на місці (досіяно відсутні вбудованими дефолтами)." >&2
+    echo "Живу таблицю не чіпав -- запусти nft-scan-detector без прапорців, щоб застосувати." >&2
+}
+
 # ---------------------------------------------------------------------------
 
 main() {
@@ -682,6 +713,11 @@ main() {
 if [[ $STOP -eq 1 ]]; then
     do_stop
     [[ $STOP_DOCKER -eq 1 ]] && do_stop_docker
+    exit 0
+fi
+
+if [[ $INIT -eq 1 ]]; then
+    do_init
     exit 0
 fi
 

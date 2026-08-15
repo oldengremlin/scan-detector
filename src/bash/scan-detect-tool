@@ -22,6 +22,8 @@
 #   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
 #                                           (застосовується рестартом scan-detector.service,
 #                                           не "живим" add element)
+#   scan-detect-tool --init                досіяти відсутні override-файли дефолтами
+#                                           (делегує nft-scan-detector --init)
 #   scan-detect-tool --dry-run ...         показати команди, нічого не змінюючи
 #
 # Вимоги: nft, jq
@@ -48,6 +50,9 @@ usage() {
                          число, дефолт -50). На відміну від інших команд
                          застосовується не одразу в живих сетах, а рестартом
                          scan-detector.service (потрібна повна перегенерація).
+  --init                 Досіяти відсутні override-файли вбудованими
+                         дефолтами (делегує nft-scan-detector --init).
+                         Живої таблиці не чіпає, аргументу не потребує.
 
 Опції:
   --dry-run              Показати команди/дії, нічого не застосовуючи
@@ -305,6 +310,17 @@ cmd_set_priority() {
     fi
 }
 
+# cmd_init -- тонка обгортка над nft-scan-detector --init: сіє відсутні
+# override-файли вбудованими дефолтами, живої таблиці не чіпає. Логіка
+# сідінгу навмисно живе тільки в nft-scan-detector, щоб не дублювати її тут.
+cmd_init() {
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) nft-scan-detector --init"
+        return 0
+    fi
+    sudo nft-scan-detector --init
+}
+
 # --- разбір аргументів ---
 
 [[ $# -eq 0 ]] && usage
@@ -326,6 +342,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="list"; ARG="${2:-}"; shift 2 ;;
         --set-priority)
             ACTION="set-priority"; ARG="${2:-}"; shift 2 ;;
+        --init)
+            ACTION="init"; shift ;;
         --dry-run)
             DRY_RUN=1; shift ;;
         -h|--help)
@@ -336,7 +354,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$ACTION" || -z "$ARG" ]]; then
+if [[ -z "$ACTION" ]] || { [[ "$ACTION" != "init" ]] && [[ -z "$ARG" ]]; }; then
     echo "Помилка: не вказано команду або аргумент (IP-адресу чи значення)." >&2
     usage
 fi
@@ -353,4 +371,5 @@ case "$ACTION" in
     add-permanent) cmd_add permanent "$ARG" ;;
     list)          cmd_list "$ARG" ;;
     set-priority)  cmd_set_priority "$ARG" ;;
+    init)          cmd_init ;;
 esac

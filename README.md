@@ -60,6 +60,51 @@ sudo systemctl enable --now scan-detector.service
 цей виклик, тепер запуск відбувається через systemd-юніт (див. нижче), впорядкований
 після Docker.
 
+## Оновлення
+
+```sh
+git pull
+sudo install -m 755 src/bash/nft-scan-detector /usr/local/sbin/nft-scan-detector
+sudo install -m 755 src/bash/scan-detect-tool  /usr/local/sbin/scan-detect-tool
+sudo systemctl restart scan-detector.service
+```
+
+**Важливо: останній рядок — `restart`, не `enable --now` і не `daemon-reload`.**
+Якщо `scan-detector.service` вже enabled і активний (типовий випадок після
+першого встановлення), `systemctl enable --now` на вже активному юніті —
+no-op: `start` на unit, який вже `active`, нічого не робить, ExecStart
+повторно не виконується. `daemon-reload` теж не рестартовує сам процес —
+він тільки перечитує визначення юніта. Тобто нову версію скрипта на диску
+жоден з цих двох викликів не підхопить — потрібен саме явний `restart`.
+(`enable --now` лишається правильною командою тільки для першого
+встановлення, коли юніта ще нема.)
+
+## Взаємодія з `nftables.service`
+
+Якщо на хості окремо є системний `nftables.service` (типово на Debian/Ubuntu,
+керує `/etc/nftables.conf`) — його старт/рестарт зазвичай виконує `flush
+ruleset` і накочує лише той файл, стираючи **весь** живий ruleset, включно з
+`inet scanDetector`. Це не залежить від override-файлів чи стану
+`scan-detector.service` — воно просто зникає з ядра при будь-якому
+`systemctl restart nftables.service`, і застосується знову лише після
+наступного `systemctl restart scan-detector.service`.
+
+Це пом'якшено двома речами:
+- `scan-detector.service` тепер впорядкований `After=nftables.service` —
+  на старті системи наша таблиця гарантовано застосовується вже після
+  того, як `nftables.conf` накотився, а не в гонці з ним;
+- опційний drop-in `systemd/nftables.service.d/restart-scan-detector.conf`
+  — автоматично рестартує `scan-detector.service` одразу після кожного
+  старту/рестарту `nftables.service` (`ExecStartPost=`), у тому числі
+  ручного. Live-стан каскаду це переживає, тож рестарт нічого не коштує.
+  Встановлюється окремо, лише якщо `nftables.service` реально є на хості:
+
+```sh
+sudo install -D -m 644 systemd/nftables.service.d/restart-scan-detector.conf \
+    /etc/systemd/system/nftables.service.d/restart-scan-detector.conf
+sudo systemctl daemon-reload
+```
+
 ## Як це працює
 
 Кожен новий (`ct state new`) пакет на вході (`input`) або на вході в docker-мережу
@@ -176,6 +221,23 @@ sudo nft-scan-detector --stop-docker     # зняти forward + systemctl stop d
 щойно хтось звернеться до сокета). Щоб повернути `forward` — достатньо
 звичайного запуску `nft-scan-detector` (без `--stop*`) після того, як Docker
 знову працює.
+
+### `--init`
+
+Ще один окремий режим — лише досіює відсутні override-файли в
+`/etc/nft-scandetect/` вбудованими дефолтами і виходить, не чіпаючи живу
+таблицю, Docker чи live-стан. Корисно, щоб проінспектувати чи заздалегідь
+поправити конфіги **до** першого реального застосування таблиці:
+
+```sh
+sudo nft-scan-detector --init
+# або те саме через scan-detect-tool:
+sudo scan-detect-tool --init
+```
+
+Взаємовиключний з рештою прапорців. Безпечно викликати й повторно, і після
+того, як таблиця вже застосована — існуючі файли не чіпає, довписує лише
+те, чого справді бракує.
 
 ## Пріоритет hook'ів `input`/`forward`
 
