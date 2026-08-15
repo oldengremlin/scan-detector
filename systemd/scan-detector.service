@@ -1,10 +1,14 @@
 [Unit]
 Description=nft-scan-detector — застосування таблиці inet scanDetector
 Documentation=https://github.com/oldengremlin/scan-detector
-# Docker — опційна залежність: якщо docker.service в системі відсутній,
-# systemd просто ігнорує цей рядок ordering, юніт стартує без Docker
-# (nft-scan-detector сам пропускає forward-правила, коли docker недоступний).
-After=network-online.target docker.service
+# Docker і nftables.service — опційні залежності: якщо якогось юніта в
+# системі нема, systemd просто ігнорує цей рядок ordering (nft-scan-detector
+# сам пропускає forward-правила, коли docker недоступний; nftables.service --
+# окремий вендорський юніт, керує /etc/nftables.conf, нас не стосується
+# напряму, крім порядку старту -- щоб не гнатись за ним і не бути стертим
+# при завантаженні системи; проти РУЧНОГО "systemctl restart nftables.service"
+# після старту це саме по собі не захищає -- див. systemd/nftables.service.d/).
+After=network-online.target docker.service nftables.service
 Wants=network-online.target
 
 [Service]
