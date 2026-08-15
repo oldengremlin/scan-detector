@@ -83,7 +83,7 @@ SRV_PORTS_DEFAULT=(tcp/80 tcp/443)
 # override-файлу ще нема на диску (перший запуск / чиста система).
 # Після появи файлу зміни в цей масив ігноруються — редагуйте файл
 # або керуйте через scan-detect-tool.
-BASE_TRUSTED="127.0.0.1"
+BASE_TRUSTED="127.0.0.0/8"
 BASE_IGNORE="0.0.0.0"
 BASE_PERMANENT=""
 BASE_IGNORE6="fe80::/64"
