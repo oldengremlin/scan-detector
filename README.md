@@ -478,6 +478,7 @@ scan-detect-tool --add-trusted 176.104.57.1
 scan-detect-tool --add-ignore 10.3.2.0/24
 scan-detect-tool --add-permanent 185.177.72.0/24
 scan-detect-tool --list 185.177.72.5
+scan-detect-tool --show                              # повний дамп table inet scanDetector
 scan-detect-tool --delete 185.177.72.5
 scan-detect-tool --dry-run --add-trusted 192.0.2.1   # показати dry-run, нічого не змінюючи
 ```
