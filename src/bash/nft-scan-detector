@@ -42,6 +42,11 @@
 # попередженням у stderr. Керується вручну або через
 # `scan-detect-tool --set-priority N`.
 #
+# /etc/nft-scandetect/ipv6 — той самий формат: РІВНО одне слово, 0/off,
+# 1/on чи auto (дефолт auto). --no-ipv6 (прапорець) переважає цей файл для
+# конкретного запуску. "auto" — sysctl (net.ipv6.conf.all.disable_ipv6) І
+# реальна маршрутизована IPv6-адреса десь на хості (включно з lo).
+#
 # /etc/nft-scandetect/level_timeouts — рядки "N:timeout", СУЦІЛЬНО від 0 без
 # пропусків/дублів (кількість рядків = кількість рівнів ескалації
 # level0..levelN / level6_0..level6_N). Невалідний формат — фолбек на
@@ -111,10 +116,48 @@ ipv6_globally_enabled() {
 
 # per-bridge перевірка -- викликається лише коли глобально IPv6 уже увімкнено;
 # відсутній sysctl-файл для інтерфейсу -- недостатньо підстав вважати IPv6
-# робочим саме на ньому, тож трактуємо як вимкнений (безпечний дефолт)
+# робочим саме на ньому, тож трактуємо як вимкнений (безпечний дефолт).
+# Навмисно НЕ вимагає реальної глобальної адреси на самому bridge (на
+# відміну від ipv6_auto_detected_enabled нижче) -- docker-мережа могла б
+# отримувати транзитний IPv6 і без власної адреси на bridge, топологій
+# забагато, щоб бути тут категоричними; sysctl per-iface лишається
+# єдиним (явним, адміністративним) сигналом на цьому рівні.
 ipv6_enabled_for_iface() {
     local f="/proc/sys/net/ipv6/conf/${1}/disable_ipv6"
     [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null)" == "0" ]]
+}
+
+# "auto" з ${OVERRIDE_DIR}/ipv6 (глобальний рівень, не per-bridge):
+# sysctl не вимкнений ГЛОБАЛЬНО, і (якщо є чим перевірити) десь на хості
+# реально є маршрутизована (не link-local) IPv6-адреса -- включно з `lo`
+# (там теж бувають "білі" адреси). Сам disable_ipv6=0 -- занадто слабкий
+# сигнал: це стан практично будь-якого інтерфейса за замовчуванням
+# (включно з щойно створеним docker-бриджем), а не доказ реальної
+# IPv6-звʼязності. Без `ip` -- перевірити нічим, довіряємось sysctl.
+ipv6_auto_detected_enabled() {
+    ipv6_globally_enabled || return 1
+    command -v ip >/dev/null 2>&1 || return 0
+    ip -6 -o addr show scope global 2>/dev/null | grep -q .
+}
+
+# Читає ${OVERRIDE_DIR}/ipv6 -- РІВНО одне слово: "0"/"off" (завжди
+# вимкнено), "1"/"on" (завжди увімкнено) чи "auto" (автовизначення,
+# ipv6_auto_detected_enabled). Відсутній файл чи нелегітимний вміст -- те
+# саме, що "auto" (з попередженням у другому випадку). Друкує "0" чи "1".
+# Визначена тут (а не біля read_priority нижче), бо top-level автодетект
+# --no-ipv6 звертається до неї ще до решти визначень функцій.
+read_ipv6_mode() {
+    local file="${OVERRIDE_DIR}/ipv6" raw
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file" | tr -d '[:space:]')
+        case "$raw" in
+            0|off) echo 0; return 0 ;;
+            1|on) echo 1; return 0 ;;
+            auto) : ;;
+            *) echo "УВАГА: $file містить нелегітимне значення ('$raw', очікується 0/1/off/on/auto) -- використовую auto." >&2 ;;
+        esac
+    fi
+    if ipv6_auto_detected_enabled; then echo 1; else echo 0; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -140,14 +183,22 @@ usage() {
                         --reset-live-state -- прапорці вільно комбінуються.
   --no-ipv6              Не генерувати жодних v6-сетів/правил (trusted6,
                         ignore6, permanentBlock6, level6_*, srv6_*, scan6,
-                        ip6-правила в input і в кожному forward). Активується
-                        й автоматично, якщо IPv6 вимкнено системно
-                        (net.ipv6.conf.all.disable_ipv6=1) чи взагалі
-                        недоступний у ядрі. Незалежно від глобального стану,
-                        для кожного docker bridge окремо ip6-правила forward
-                        пропускаються, якщо саме на цьому bridge IPv6
-                        вимкнено (net.ipv6.conf.<bridge>.disable_ipv6=1) --
-                        решта бриджів це не зачіпає.
+                        ip6-правила в input і в кожному forward). Разовий
+                        force-off для цього запуску -- переважає файл
+                        ${OVERRIDE_DIR}/ipv6 нижче. Незалежно від
+                        глобального стану, для кожного docker bridge
+                        окремо ip6-правила forward пропускаються, якщо
+                        саме на цьому bridge IPv6 вимкнено
+                        (net.ipv6.conf.<bridge>.disable_ipv6=1) -- решта
+                        бриджів це не зачіпає.
+
+${OVERRIDE_DIR}/ipv6 -- постійне налаштування (рівно одне слово: 0/off,
+1/on чи auto, дефолт auto), якщо --no-ipv6 не передано:
+  0, off  завжди вимкнено (як --no-ipv6, але постійно, без прапорця)
+  1, on   завжди увімкнено, незалежно від sysctl чи наявних адрес
+  auto    автовизначення: net.ipv6.conf.all.disable_ipv6=0 (чи взагалі
+          відсутній /proc/sys/net/ipv6 -- тоді вимкнено) І десь на хості
+          (включно з lo) є реальна маршрутизована (не link-local) адреса
 
 --stop-fwd / --stop-fwd-docker -- окремий режим, нічого не перегенеровує, а
 лише знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не
@@ -218,11 +269,11 @@ if [[ $STANDALONE_MODES -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/de
     NO_DOCKER=1
 fi
 
-# IPv6 вимкнено системно -- те саме, тільки для v6: net.ipv6.conf.all.disable_ipv6=1
-# (чи взагалі відсутній /proc/sys/net/ipv6 -- ядро без підтримки IPv6) means
-# ЖОДЕН інтерфейс IPv6-пакетів не обробляє, незалежно від per-iface налаштувань.
-if [[ $STANDALONE_MODES -eq 0 && $NO_IPV6 -eq 0 ]] && ! ipv6_globally_enabled; then
-    echo "IPv6 вимкнено системно -- v6-правила не генеруються (як --no-ipv6)." >&2
+# IPv6: --no-ipv6 (перевірено вище) -- разовий force-off, що переважає все
+# інше. Якщо його не було -- рішення за ${OVERRIDE_DIR}/ipv6 (0/1/auto), де
+# "auto" -- те саме автовизначення (sysctl + реальна адреса), що й раніше.
+if [[ $STANDALONE_MODES -eq 0 && $NO_IPV6 -eq 0 ]] && [[ "$(read_ipv6_mode)" == "0" ]]; then
+    echo "IPv6 не генерується (${OVERRIDE_DIR}/ipv6 чи автовизначення) -- v6-правила пропускаються." >&2
     NO_IPV6=1
 fi
 
@@ -272,6 +323,15 @@ seed_priority_if_missing() {
     [[ -f "$file" ]] && return 0
     sudo mkdir -p "$OVERRIDE_DIR"
     echo "$DEFAULT_PRIORITY" | sudo tee "$file" >/dev/null
+}
+
+# ${OVERRIDE_DIR}/ipv6 -- рівно одне слово (0/1/auto), той самий формат, що
+# й priority. Дефолт -- "auto" (те, що й було весь цей час: автовизначення).
+seed_ipv6_mode_if_missing() {
+    local file="${OVERRIDE_DIR}/ipv6"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    echo "auto" | sudo tee "$file" >/dev/null
 }
 
 # Читає й валідує пріоритет з ${OVERRIDE_DIR}/priority. Нелегітимне значення
@@ -611,6 +671,7 @@ seed_all_config_if_missing() {
     seed_if_missing "${OVERRIDE_DIR}/ignore6-extra.list"    "$BASE_IGNORE6"
     seed_if_missing "${OVERRIDE_DIR}/permanent6-extra.list" "$BASE_PERMANENT6"
     seed_priority_if_missing
+    seed_ipv6_mode_if_missing
     seed_level_timeouts_if_missing
     seed_srv_ports_if_missing
     seed_srv_timeouts_if_missing
