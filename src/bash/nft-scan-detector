@@ -629,17 +629,17 @@ build_ruleset() {
     echo "add table ${TABLE}"
 
     # --- статичні IPv4 сети ---
-    echo "add set ${TABLE} trusted { type ipv4_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    echo "add set ${TABLE} trusted { type ipv4_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
     [[ -n "$trusted" ]] && echo "add element ${TABLE} trusted { ${trusted} }"
-    echo "add set ${TABLE} ignore { type ipv4_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    echo "add set ${TABLE} ignore { type ipv4_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
     [[ -n "$ignore" ]] && echo "add element ${TABLE} ignore { ${ignore} }"
     echo "add set ${TABLE} permanentBlock { type ipv4_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
     [[ -n "$permanent" ]] && echo "add element ${TABLE} permanentBlock { ${permanent} }"
 
     # --- статичні IPv6 сети ---
-    echo "add set ${TABLE} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    echo "add set ${TABLE} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
     [[ -n "$trusted6" ]] && echo "add element ${TABLE} trusted6 { ${trusted6} }"
-    echo "add set ${TABLE} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"AS12593 NOC\"; }"
+    echo "add set ${TABLE} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
     [[ -n "$ignore6" ]] && echo "add element ${TABLE} ignore6 { ${ignore6} }"
     echo "add set ${TABLE} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
     [[ -n "$permanent6" ]] && echo "add element ${TABLE} permanentBlock6 { ${permanent6} }"
