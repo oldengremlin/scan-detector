@@ -63,6 +63,7 @@ OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
 RESET_LIVE_STATE=0
 NO_DOCKER=0
+NO_IPV6=0
 STOP_FWD=0
 STOP_FWD_DOCKER=0
 STOP_ALL=0
@@ -100,11 +101,27 @@ BASE_PERMANENT6=""
 # `scan-detect-tool --set-priority`) -- див. read_priority нижче.
 DEFAULT_PRIORITY=-50
 
+# Живий IPv6 -- перевіряємо через net.ipv6.conf.*.disable_ipv6 (0 -- увімкнено).
+# Функції визначені тут, до usage()/розбору аргументів, бо автодетект --no-ipv6
+# нижче звертається до ipv6_globally_enabled ще перед рештою визначень функцій.
+ipv6_globally_enabled() {
+    local f=/proc/sys/net/ipv6/conf/all/disable_ipv6
+    [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null)" == "0" ]]
+}
+
+# per-bridge перевірка -- викликається лише коли глобально IPv6 уже увімкнено;
+# відсутній sysctl-файл для інтерфейсу -- недостатньо підстав вважати IPv6
+# робочим саме на ньому, тож трактуємо як вимкнений (безпечний дефолт)
+ipv6_enabled_for_iface() {
+    local f="/proc/sys/net/ipv6/conf/${1}/disable_ipv6"
+    [[ -r "$f" ]] && [[ "$(cat "$f" 2>/dev/null)" == "0" ]]
+}
+
 # ---------------------------------------------------------------------------
 
 usage() {
     cat <<EOF
-Використання: $(basename "$0") [--reset-live-state] [--no-docker]
+Використання: $(basename "$0") [--reset-live-state] [--no-docker] [--no-ipv6]
        $(basename "$0") --stop-fwd | --stop-fwd-docker
        $(basename "$0") --stop
        $(basename "$0") --init
@@ -121,6 +138,16 @@ usage() {
                         лишається тільки input. Активується й автоматично,
                         якщо бінарника docker немає на хості. Незалежний від
                         --reset-live-state -- прапорці вільно комбінуються.
+  --no-ipv6              Не генерувати жодних v6-сетів/правил (trusted6,
+                        ignore6, permanentBlock6, level6_*, srv6_*, scan6,
+                        ip6-правила в input і в кожному forward). Активується
+                        й автоматично, якщо IPv6 вимкнено системно
+                        (net.ipv6.conf.all.disable_ipv6=1) чи взагалі
+                        недоступний у ядрі. Незалежно від глобального стану,
+                        для кожного docker bridge окремо ip6-правила forward
+                        пропускаються, якщо саме на цьому bridge IPv6
+                        вимкнено (net.ipv6.conf.<bridge>.disable_ipv6=1) --
+                        решта бриджів це не зачіпає.
 
 --stop-fwd / --stop-fwd-docker -- окремий режим, нічого не перегенеровує, а
 лише знімає ланцюг forward із ЖИВОЇ таблиці (input, сети й live-стан не
@@ -155,6 +182,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --reset-live-state) RESET_LIVE_STATE=1; shift ;;
         --no-docker) NO_DOCKER=1; shift ;;
+        --no-ipv6) NO_IPV6=1; shift ;;
         --stop-fwd) STOP_FWD=1; shift ;;
         --stop-fwd-docker) STOP_FWD=1; STOP_FWD_DOCKER=1; shift ;;
         --stop) STOP_ALL=1; shift ;;
@@ -176,8 +204,8 @@ if [[ $STANDALONE_MODES -gt 1 ]]; then
     exit 1
 fi
 
-if [[ $STANDALONE_MODES -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 ) ]]; then
-    echo "Помилка: --stop-fwd*/--stop/--init не можна комбінувати з --reset-live-state/--no-docker." >&2
+if [[ $STANDALONE_MODES -eq 1 && ( $RESET_LIVE_STATE -eq 1 || $NO_DOCKER -eq 1 || $NO_IPV6 -eq 1 ) ]]; then
+    echo "Помилка: --stop-fwd*/--stop/--init не можна комбінувати з --reset-live-state/--no-docker/--no-ipv6." >&2
     exit 1
 fi
 
@@ -188,6 +216,14 @@ fi
 if [[ $STANDALONE_MODES -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
     echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
     NO_DOCKER=1
+fi
+
+# IPv6 вимкнено системно -- те саме, тільки для v6: net.ipv6.conf.all.disable_ipv6=1
+# (чи взагалі відсутній /proc/sys/net/ipv6 -- ядро без підтримки IPv6) means
+# ЖОДЕН інтерфейс IPv6-пакетів не обробляє, незалежно від per-iface налаштувань.
+if [[ $STANDALONE_MODES -eq 0 && $NO_IPV6 -eq 0 ]] && ! ipv6_globally_enabled; then
+    echo "IPv6 вимкнено системно -- v6-правила не генеруються (як --no-ipv6)." >&2
+    NO_IPV6=1
 fi
 
 read_extra() {
@@ -636,25 +672,27 @@ build_ruleset() {
     echo "add set ${TABLE} permanentBlock { type ipv4_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
     [[ -n "$permanent" ]] && echo "add element ${TABLE} permanentBlock { ${permanent} }"
 
-    # --- статичні IPv6 сети ---
-    echo "add set ${TABLE} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
-    [[ -n "$trusted6" ]] && echo "add element ${TABLE} trusted6 { ${trusted6} }"
-    echo "add set ${TABLE} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
-    [[ -n "$ignore6" ]] && echo "add element ${TABLE} ignore6 { ${ignore6} }"
-    echo "add set ${TABLE} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
-    [[ -n "$permanent6" ]] && echo "add element ${TABLE} permanentBlock6 { ${permanent6} }"
+    # --- статичні IPv6 сети + srv6_*/level6_*/scan6 -- тільки якщо IPv6 не
+    # вимкнено глобально (--no-ipv6 чи автовизначено); інакше жоден з цих
+    # сетів узагалі не потрібен -- нема кому в них щось писати
+    if [[ $NO_IPV6 -eq 0 ]]; then
+        echo "add set ${TABLE} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
+        [[ -n "$trusted6" ]] && echo "add element ${TABLE} trusted6 { ${trusted6} }"
+        echo "add set ${TABLE} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
+        [[ -n "$ignore6" ]] && echo "add element ${TABLE} ignore6 { ${ignore6} }"
+        echo "add set ${TABLE} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
+        [[ -n "$permanent6" ]] && echo "add element ${TABLE} permanentBlock6 { ${permanent6} }"
+        gen_srv_sets ipv6_addr srv6_
+        gen_level_sets ipv6_addr level6_
+        echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
+        emit_restore "scan6"
+    fi
 
-    # --- srv_* / srv6_* ---
+    # --- srv_* / level0..level15 (ipv4 -- завжди) ---
     gen_srv_sets ipv4_addr srv_
-    gen_srv_sets ipv6_addr srv6_
-
-    # --- level0..level15 / level6_0..level6_15 ---
     gen_level_sets ipv4_addr level
     echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
     emit_restore "scan"
-    gen_level_sets ipv6_addr level6_
-    echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
-    emit_restore "scan6"
 
     # --- ланцюги ---
     echo "add chain ${TABLE} input { type filter hook input priority ${priority}; }"
@@ -664,10 +702,13 @@ build_ruleset() {
     gen_srv_rules_all_ports input ip srv_
     gen_level_rules input ip level scan
 
-    # --- input: ipv6 ---
-    gen_static_guard6_rules input
-    gen_srv_rules_all_ports input ip6 srv6_
-    gen_level_rules input ip6 level6_ scan6
+    # --- input: ipv6 (глобальний перемикач -- input не per-interface, тож
+    # тонше за "усе або нічого" тут не буває) ---
+    if [[ $NO_IPV6 -eq 0 ]]; then
+        gen_static_guard6_rules input
+        gen_srv_rules_all_ports input ip6 srv6_
+        gen_level_rules input ip6 level6_ scan6
+    fi
 
     # --- forward: тільки якщо Docker не вимкнено -- інакше ланцюга forward
     # у таблиці взагалі нема, і hook forward цю таблицю не чіпає
@@ -684,9 +725,14 @@ build_ruleset() {
         gen_srv_rules_all_ports forward ip srv_ "$ifm"
         gen_level_rules forward ip level scan "$ifm"
 
-        gen_static_guard6_rules forward "$ifm"
-        gen_srv_rules_all_ports forward ip6 srv6_ "$ifm"
-        gen_level_rules forward ip6 level6_ scan6 "$ifm"
+        # ipv6 для forward -- і глобально не вимкнено, і саме на ЦЬОМУ bridge
+        # IPv6 увімкнено (кожен bridge перевіряється окремо, незалежно від
+        # сусідніх -- один без IPv6 не позначається на решті)
+        if [[ $NO_IPV6 -eq 0 ]] && ipv6_enabled_for_iface "$iface"; then
+            gen_static_guard6_rules forward "$ifm"
+            gen_srv_rules_all_ports forward ip6 srv6_ "$ifm"
+            gen_level_rules forward ip6 level6_ scan6 "$ifm"
+        fi
     done < <(get_docker_bridges)
     return 0
 }
