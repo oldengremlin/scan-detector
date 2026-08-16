@@ -19,6 +19,7 @@
 #   scan-detect-tool --add-trusted IP      додати в trusted/trusted6
 #   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
 #   scan-detect-tool --list IP             показати живі сети + override-файли, де є IP
+#   scan-detect-tool --show                вивести повністю table inet scanDetector
 #   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
 #                                           (застосовується рестартом scan-detector.service,
 #                                           не "живим" add element)
@@ -46,6 +47,8 @@ usage() {
   --add-trusted IP       Додати IP в trusted (trusted6 для IPv6)
   --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
   --list IP              Показати живі сети та override-файли, де присутній IP
+  --show                 Вивести повністю живу таблицю (nft list table inet
+                         scanDetector) -- усі сети й правила як є зараз
   --set-priority N       Перевизначити пріоритет hook'ів input/forward (ціле
                          число, дефолт -50). На відміну від інших команд
                          застосовується не одразу в живих сетах, а рестартом
@@ -230,6 +233,12 @@ cmd_list() {
     return 0
 }
 
+# cmd_show -- виводить nft list table inet scanDetector як є (без --dry-run
+# особливостей: команда й так нічого не змінює, лише читає)
+cmd_show() {
+    sudo nft list table "${TABLE_FAMILY}" "${TABLE_NAME}"
+}
+
 cmd_delete() {
     local ip="$1"
     validate_ip "$ip"
@@ -340,6 +349,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="add-permanent"; ARG="${2:-}"; shift 2 ;;
         --list)
             ACTION="list"; ARG="${2:-}"; shift 2 ;;
+        --show)
+            ACTION="show"; shift ;;
         --set-priority)
             ACTION="set-priority"; ARG="${2:-}"; shift 2 ;;
         --init)
@@ -354,7 +365,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$ACTION" ]] || { [[ "$ACTION" != "init" ]] && [[ -z "$ARG" ]]; }; then
+if [[ -z "$ACTION" ]] || { [[ "$ACTION" != "init" ]] && [[ "$ACTION" != "show" ]] && [[ -z "$ARG" ]]; }; then
     echo "Помилка: не вказано команду або аргумент (IP-адресу чи значення)." >&2
     usage
 fi
@@ -370,6 +381,7 @@ case "$ACTION" in
     add-trusted)   cmd_add trusted   "$ARG" ;;
     add-permanent) cmd_add permanent "$ARG" ;;
     list)          cmd_list "$ARG" ;;
+    show)          cmd_show ;;
     set-priority)  cmd_set_priority "$ARG" ;;
     init)          cmd_init ;;
 esac
