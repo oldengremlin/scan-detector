@@ -42,6 +42,13 @@
 # попередженням у stderr. Керується вручну або через
 # `scan-detect-tool --set-priority N`.
 #
+# /etc/nft-scandetect/table_name — той самий формат: РІВНО одна назва
+# (легітимний nft-ідентифікатор), таблиця "<table_name>" замість
+# заводського "scanDetector" (дефолт). Родина (inet) не конфігурується.
+# Керується вручну або через `scan-detect-tool --set-table-name NAME` —
+# на відміну від решти override-файлів, зміна назви таблиці прибирає й
+# СТАРУ таблицю (nft не вміє її перейменувати "на місці").
+#
 # /etc/nft-scandetect/ipv6 — той самий формат: РІВНО одне слово, 0/off,
 # 1/on чи auto (дефолт auto). --no-ipv6 (прапорець) переважає цей файл для
 # конкретного запуску. "auto" — sysctl (net.ipv6.conf.all.disable_ipv6) І
@@ -63,7 +70,7 @@
 
 set -euo pipefail
 
-TABLE="inet scanDetector"
+TABLE_FAMILY="inet"
 OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
 RESET_LIVE_STATE=0
@@ -105,6 +112,12 @@ BASE_PERMANENT6=""
 # ${OVERRIDE_DIR}/priority (одне ціле число, керується вручну або через
 # `scan-detect-tool --set-priority`) -- див. read_priority нижче.
 DEFAULT_PRIORITY=-50
+
+# Назва nft-таблиці (родина -- завжди TABLE_FAMILY, не конфігурується: inet
+# потрібен для одночасних ip/ip6 правил в одній таблиці). Перевизначається
+# файлом ${OVERRIDE_DIR}/table_name (керується вручну або через
+# `scan-detect-tool --set-table-name`) -- див. read_table_name нижче.
+DEFAULT_TABLE_NAME="scanDetector"
 
 # Живий IPv6 -- перевіряємо через net.ipv6.conf.*.disable_ipv6 (0 -- увімкнено).
 # Функції визначені тут, до usage()/розбору аргументів, бо автодетект --no-ipv6
@@ -159,6 +172,26 @@ read_ipv6_mode() {
     fi
     if ipv6_auto_detected_enabled; then echo 1; else echo 0; fi
 }
+
+# Читає ${OVERRIDE_DIR}/table_name -- РІВНО один рядок, легітимний
+# nft-ідентифікатор (літери/цифри/підкреслення, не починається з цифри).
+# Відсутній файл чи нелегітимний вміст -- фолбек на DEFAULT_TABLE_NAME (з
+# попередженням у другому випадку). Визначена тут (до usage()/TABLE нижче),
+# бо ${TABLE} мусить бути готовий ще до першого можливого виклику usage().
+read_table_name() {
+    local file="${OVERRIDE_DIR}/table_name" raw
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file" | tr -d '[:space:]')
+        if [[ "$raw" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "$raw"
+            return 0
+        fi
+        echo "УВАГА: $file містить нелегітимну назву таблиці ('$raw') -- використовую дефолт ${DEFAULT_TABLE_NAME}." >&2
+    fi
+    echo "$DEFAULT_TABLE_NAME"
+}
+
+TABLE="${TABLE_FAMILY} $(read_table_name)"
 
 # ---------------------------------------------------------------------------
 
@@ -217,6 +250,13 @@ forward, і всі сети/live-стан). Хост і docker-мережі пі
 
   --stop                Повністю видалити таблицю ${TABLE}, більше нічого
                         не робити.
+
+${OVERRIDE_DIR}/table_name -- постійне налаштування (рівно одна назва,
+легітимний nft-ідентифікатор), дефолт "scanDetector". Родина (inet) не
+конфігурується. Керується вручну або через
+scan-detect-tool --set-table-name NAME (той сеттер додатково прибирає
+СТАРУ таблицю під попередньою назвою -- nft не вміє перейменувати "на
+місці").
 
 --init -- ще один окремий режим: лише сіє всі override-файли в
 ${OVERRIDE_DIR} вбудованими дефолтами, якщо їх ще нема (ті самі
@@ -323,6 +363,14 @@ seed_priority_if_missing() {
     [[ -f "$file" ]] && return 0
     sudo mkdir -p "$OVERRIDE_DIR"
     echo "$DEFAULT_PRIORITY" | sudo tee "$file" >/dev/null
+}
+
+# ${OVERRIDE_DIR}/table_name -- той самий однорядковий формат, що й priority.
+seed_table_name_if_missing() {
+    local file="${OVERRIDE_DIR}/table_name"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    echo "$DEFAULT_TABLE_NAME" | sudo tee "$file" >/dev/null
 }
 
 # ${OVERRIDE_DIR}/ipv6 -- рівно одне слово (0/1/auto), той самий формат, що
@@ -671,6 +719,7 @@ seed_all_config_if_missing() {
     seed_if_missing "${OVERRIDE_DIR}/ignore6-extra.list"    "$BASE_IGNORE6"
     seed_if_missing "${OVERRIDE_DIR}/permanent6-extra.list" "$BASE_PERMANENT6"
     seed_priority_if_missing
+    seed_table_name_if_missing
     seed_ipv6_mode_if_missing
     seed_level_timeouts_if_missing
     seed_srv_ports_if_missing

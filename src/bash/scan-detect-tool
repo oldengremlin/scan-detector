@@ -23,6 +23,9 @@
 #   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
 #                                           (застосовується рестартом scan-detector.service,
 #                                           не "живим" add element)
+#   scan-detect-tool --set-table-name NAME перевизначити назву nft-таблиці (дефолт
+#                                           scanDetector); так само рестартом, і
+#                                           додатково прибирає стару таблицю
 #   scan-detect-tool --init                досіяти відсутні override-файли дефолтами
 #                                           (делегує nft-scan-detector --init)
 #   scan-detect-tool --dry-run ...         показати команди, нічого не змінюючи
@@ -32,9 +35,27 @@
 set -euo pipefail
 
 TABLE_FAMILY="inet"
-TABLE_NAME="scanDetector"
+DEFAULT_TABLE_NAME="scanDetector"
 OVERRIDE_DIR="/etc/nft-scandetect"
 DRY_RUN=0
+
+# Читає ${OVERRIDE_DIR}/table_name -- той самий формат і фолбек-логіка, що й
+# у nft-scan-detector (read_table_name там) -- обидва скрипти мають бачити
+# ту саму назву таблиці, інакше редагування/показ підуть не в ту таблицю.
+read_table_name() {
+    local file="${OVERRIDE_DIR}/table_name" raw
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file" | tr -d '[:space:]')
+        if [[ "$raw" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "$raw"
+            return 0
+        fi
+        echo "УВАГА: $file містить нелегітимну назву таблиці ('$raw') -- використовую дефолт ${DEFAULT_TABLE_NAME}." >&2
+    fi
+    echo "$DEFAULT_TABLE_NAME"
+}
+
+TABLE_NAME="$(read_table_name)"
 
 usage() {
     cat <<EOF
@@ -53,6 +74,11 @@ usage() {
                          число, дефолт -50). На відміну від інших команд
                          застосовується не одразу в живих сетах, а рестартом
                          scan-detector.service (потрібна повна перегенерація).
+  --set-table-name NAME  Перевизначити назву nft-таблиці (дефолт scanDetector).
+                         Так само повна перегенерація рестартом
+                         scan-detector.service, і додатково прибирає стару
+                         таблицю під попередньою назвою (nft не вміє
+                         перейменувати таблицю "на місці").
   --init                 Досіяти відсутні override-файли вбудованими
                          дефолтами (делегує nft-scan-detector --init).
                          Живої таблиці не чіпає, аргументу не потребує.
@@ -319,6 +345,59 @@ cmd_set_priority() {
     fi
 }
 
+# cmd_set_table_name NAME -- перевизначає назву nft-таблиці
+# (${OVERRIDE_DIR}/table_name). На відміну від решти команд тут МАЛО просто
+# перезаписати файл і рестартнути scan-detector.service: nft не вміє
+# перейменувати таблицю "на місці" -- звичайний перезапуск створив би НОВУ
+# таблицю під новою назвою поруч зі СТАРОЮ (та лишилась би назавжди активна,
+# й далі фільтрувала б трафік під забутою назвою). Тож тут явно приберається
+# стара таблиця (якщо вона є) перед рестартом.
+cmd_set_table_name() {
+    local raw="$1" value old_name file
+    value="${raw//[[:space:]]/}"
+    if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
+        exit 1
+    fi
+    old_name="$TABLE_NAME"
+    file="${OVERRIDE_DIR}/table_name"
+
+    if [[ "$value" == "$old_name" ]]; then
+        echo "Назва таблиці вже '$value' -- нічого не змінюю."
+        return 0
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "(dry-run) echo '$value' > $file"
+        echo "(dry-run) nft delete table ${TABLE_FAMILY} ${old_name}   # стара таблиця, якщо існує"
+        echo "(dry-run) systemctl restart scan-detector.service"
+        return 0
+    fi
+
+    sudo mkdir -p "$OVERRIDE_DIR"
+    echo "$value" | sudo tee "$file" >/dev/null
+    echo "Нову назву таблиці збережено: $value ($file)."
+
+    echo "Назва таблиці міняє саму nft-таблицю -- це не \"живий\" add element," >&2
+    echo "а повна перегенерація. Прибираю стару таблицю ${TABLE_FAMILY} ${old_name}, якщо є..." >&2
+    if sudo nft list table "${TABLE_FAMILY}" "$old_name" >/dev/null 2>&1; then
+        if sudo nft delete table "${TABLE_FAMILY}" "$old_name"; then
+            echo "Стару таблицю ${TABLE_FAMILY} ${old_name} видалено." >&2
+        else
+            echo "УВАГА: не вдалось видалити стару таблицю ${TABLE_FAMILY} ${old_name} -- приберіть вручну (sudo nft delete table ${TABLE_FAMILY} ${old_name})." >&2
+        fi
+    else
+        echo "Старої таблиці ${TABLE_FAMILY} ${old_name} і так нема -- нічого прибирати." >&2
+    fi
+
+    echo "Рестартую scan-detector.service..." >&2
+    if sudo systemctl restart scan-detector.service 2>/dev/null; then
+        echo "Застосовано."
+    else
+        echo "УВАГА: не вдалось перезапустити scan-detector.service -- застосуйте вручну: sudo nft-scan-detector" >&2
+    fi
+}
+
 # cmd_init -- тонка обгортка над nft-scan-detector --init: сіє відсутні
 # override-файли вбудованими дефолтами, живої таблиці не чіпає. Логіка
 # сідінгу навмисно живе тільки в nft-scan-detector, щоб не дублювати її тут.
@@ -353,6 +432,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="show"; shift ;;
         --set-priority)
             ACTION="set-priority"; ARG="${2:-}"; shift 2 ;;
+        --set-table-name)
+            ACTION="set-table-name"; ARG="${2:-}"; shift 2 ;;
         --init)
             ACTION="init"; shift ;;
         --dry-run)
@@ -383,5 +464,6 @@ case "$ACTION" in
     list)          cmd_list "$ARG" ;;
     show)          cmd_show ;;
     set-priority)  cmd_set_priority "$ARG" ;;
+    set-table-name) cmd_set_table_name "$ARG" ;;
     init)          cmd_init ;;
 esac
