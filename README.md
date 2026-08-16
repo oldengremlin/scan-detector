@@ -312,6 +312,53 @@ sudo scan-detect-tool --init
 того, як таблиця вже застосована — існуючі файли не чіпає, довписує лише
 те, чого справді бракує.
 
+### Як усе це обробляється разом
+
+Валідація, автовизначення `--no-docker`/`--no-ipv6` і фінальна
+диспетчеризація — в такому порядку (1:1 з кодом, не спрощено):
+
+```mermaid
+flowchart TD
+    A["Розбір CLI-аргументів"] --> B["STANDALONE_MODES = кількість увімкнених<br/>серед --stop-fwd / --stop / --init"]
+    B --> C{"STANDALONE_MODES > 1?"}
+    C -- так --> ERR1[["Помилка:<br/>режими взаємовиключні між собою"]]
+    C -- ні --> D{"STANDALONE_MODES = 1 і передано<br/>--reset-live-state / --no-docker / --no-ipv6?"}
+    D -- так --> ERR2[["Помилка: режим не можна<br/>комбінувати з модифікаторами"]]
+    D -- ні --> D2{"STANDALONE_MODES = 0?"}
+
+    D2 -- "ні (валідний --stop-fwd*/--stop/--init)" --> N
+    D2 -- так --> E{"--no-docker передано?"}
+
+    E -- ні --> F{"docker є в PATH?"}
+    F -- ні --> G["NO_DOCKER = 1"]
+    F -- так --> H
+    E -- так --> H{"--no-ipv6 передано?"}
+    G --> H
+
+    H -- ні --> I["читає /etc/nft-scandetect/ipv6"]
+    I --> J{"значення файлу?"}
+    J -- "0 / off" --> K["NO_IPV6 = 1"]
+    J -- "1 / on" --> L["NO_IPV6 = 0"]
+    J -- auto --> M{"sysctl не вимкнено ГЛОБАЛЬНО<br/>і є хоч одна scope-global<br/>IPv6-адреса на хості (вкл. lo)?"}
+    M -- так --> L
+    M -- ні --> K
+    H -- так --> N
+    K --> N
+    L --> N
+
+    N{"Диспетчеризація"}
+    N -- "--stop-fwd" --> O["do_stop_fwd<br/>(+ do_stop_docker при --stop-fwd-docker)"]
+    N -- "--stop" --> P["do_stop_all<br/>(delete table повністю)"]
+    N -- "--init" --> Q["do_init<br/>(лише сідінг override-файлів)"]
+    N -- "жоден з трьох" --> R["main → build_ruleset:<br/>RESET_LIVE_STATE / NO_DOCKER / NO_IPV6<br/>+ окремий per-bridge IPv6-чек у forward"]
+```
+
+Один нюанс поза діаграмою: `--no-docker`/`--no-ipv6` — глобальні рішення
+(на весь ruleset), а per-bridge IPv6-чек у блоці `R` — окрема, простіша
+перевірка (лише `net.ipv6.conf.<bridge>.disable_ipv6`, без вимоги реальної
+адреси), що виконується для **кожного** docker bridge під час генерації
+`forward`, незалежно від того, що вирішив блок `H`–`M` вище.
+
 ## Пріоритет hook'ів `input`/`forward`
 
 Дефолт — `-50` (як в оригінальному скрипті 10 років тому). Перевизначається
