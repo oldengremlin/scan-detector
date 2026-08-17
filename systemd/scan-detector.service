@@ -15,6 +15,12 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/nft-scan-detector
+# Без ExecStop "systemctl stop" для oneshot+RemainAfterExit нічого не
+# виконує -- лише позначає юніт неактивним, таблиця лишається живою. --stop
+# знімає live-стан каскаду в /var/lib/nft-scandetect/live-state-pending.tsv
+# ПЕРЕД видаленням таблиці -- наступний start/restart автоматично його
+# підхоплює й відновлює, тож "погашення" через systemctl безпечне.
+ExecStop=/usr/local/sbin/nft-scan-detector --stop
 StandardOutput=journal
 StandardError=journal
 

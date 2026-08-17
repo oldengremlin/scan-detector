@@ -96,10 +96,19 @@ ruleset` і накочує лише той файл, стираючи **весь
   на старті системи наша таблиця гарантовано застосовується вже після
   того, як `nftables.conf` накотився, а не в гонці з ним;
 - опційний drop-in `systemd/nftables.service.d/restart-scan-detector.conf`
-  — автоматично рестартує `scan-detector.service` одразу після кожного
-  старту/рестарту `nftables.service` (`ExecStartPost=`), у тому числі
-  ручного. Live-стан каскаду це переживає, тож рестарт нічого не коштує.
-  Встановлюється окремо, лише якщо `nftables.service` реально є на хості:
+  — двома хуками навколо `nftables.service`:
+  - `ExecStartPre=` — знімає live-стан каскаду (scan/level\*/srv_\*) в
+    `/var/lib/nft-scandetect/live-state-pending.tsv` і видаляє нашу таблицю
+    **ще до** того, як `flush ruleset` зробить це сам (той самий шлях, що
+    й `nft-scan-detector --stop`). Без цього кроку знімати після `flush`
+    було б уже нічого;
+  - `ExecStartPost=` — рестартує `scan-detector.service` вже після
+    `flush`; той підхоплює відкладений знімок і відновлює каскад.
+
+  Разом ці два хуки і дають "рестарт нічого не коштує" — без `ExecStartPre`
+  (як було раніше) знімати на момент `ExecStartPost` уже нема звідки: живий
+  стан втрачається мовчки. Встановлюється окремо, лише якщо
+  `nftables.service` реально є на хості:
 
 ```sh
 sudo install -D -m 644 systemd/nftables.service.d/restart-scan-detector.conf \
@@ -284,16 +293,33 @@ Docker знову працює.
 ### `--stop`
 
 Ще один окремий режим — прибирає `inet scanDetector` із системи **повністю**
-(`delete table`): і `input`, і `forward`, і всі сети разом з live-станом.
-На відміну від `--stop-fwd`, після цього хост і docker-мережі не захищені
-scanDetector-ом жодним чином, а не лише в частині `forward`:
+(`delete table`): і `input`, і `forward`, і всі сети. На відміну від
+`--stop-fwd`, після цього хост і docker-мережі не захищені scanDetector-ом
+жодним чином, а не лише в частині `forward`:
 
 ```sh
 sudo nft-scan-detector --stop
 ```
 
-Щоб повернути — звичайний запуск `nft-scan-detector` (перестворює таблицю з
-нуля; live-стан за час "простою", природно, вже нізвідки відновлювати).
+Live-стан каскаду (scan/level\*/srv\_\*) перед видаленням не втрачається —
+лягає у фіксований файл `/var/lib/nft-scandetect/live-state-pending.tsv`.
+Щоб повернути захист — звичайний запуск `nft-scan-detector` (без окремих
+режимів) чи `systemctl start`/`restart scan-detector.service`: перший же
+такий запуск бачить цей файл, відновлює каскад із нього (з коректно
+пересчитаним рештою таймауту) і видаляє файл — одноразове споживання,
+незалежно від того, скільки часу минуло між `--stop` і поверненням.
+`--reset-live-state` цей файл ігнорує й прибирає теж — явний запит почати
+з чистого.
+
+Це і є `ExecStop` у `scan-detector.service`: `systemctl stop
+scan-detector.service` тепер реально гасить таблицю (раніше — ні: юніт
+`Type=oneshot` з `RemainAfterExit=yes` без `ExecStop` на `stop` лише
+позначає себе неактивним у systemd, живої nft-таблиці взагалі не чіпаючи).
+`systemctl restart` (його використовують `docker-network-watch` і
+drop-in на `nftables.service`) тим часом лишається безпечним — `stop`-фаза
+рестарту так само сташить стан у той самий файл, а `start`-фаза одразу ж
+його забирає, тож пауза між ними — мілісекунди, і жодних відчутних змін
+у таймаутах не відбувається.
 
 ### `--init`
 

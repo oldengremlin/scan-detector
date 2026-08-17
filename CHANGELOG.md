@@ -130,6 +130,30 @@
   без цього кроку стара таблиця лишилась би назавжди активною в системі
   поруч з новою, продовжуючи фільтрувати трафік під забутою назвою; live-стан
   каскаду цей рестарт не переживає, як і будь-який `nft delete table`).
+- `--stop` тепер зберігає live-стан каскаду (`scan`/`level*`/`srv_*`) перед
+  видаленням таблиці — у фіксований файл
+  `/var/lib/nft-scandetect/live-state-pending.tsv`. Перший наступний
+  звичайний запуск (`nft-scan-detector` без прапорців чи
+  `systemctl start`/`restart scan-detector.service`) підхоплює цей файл і
+  відновлює каскад із коректно пересчитаною рештою таймауту — незалежно від
+  того, скільки часу минуло між `--stop` і поверненням. Одноразове
+  споживання (файл видаляється після використання); `--reset-live-state`
+  ігнорує й прибирає його теж.
+- `scan-detector.service`: доданий `ExecStop=nft-scan-detector --stop`.
+  Юніт — `Type=oneshot` з `RemainAfterExit=yes`; без `ExecStop`
+  `systemctl stop` лише позначає юніт неактивним у systemd, живої
+  nft-таблиці взагалі не чіпаючи (таблиця мовчки лишається в ядрі). Тепер
+  `systemctl stop scan-detector.service` реально гасить захист, а
+  `systemctl restart` (його використовують `docker-network-watch` і
+  drop-in на `nftables.service`) лишається безпечним — `stop`-фаза
+  рестарту сташить стан у той самий pending-файл, а `start`-фаза одразу ж
+  його забирає.
+- Drop-in `systemd/nftables.service.d/restart-scan-detector.conf`: доданий
+  `ExecStartPre=nft-scan-detector --stop` — знімає live-стан і видаляє нашу
+  таблицю ще ДО того, як `flush ruleset` зробить це сам (той самий шлях,
+  що й `ExecStop` вище). Раніше `ExecStartPost` рестартував
+  `scan-detector.service` вже ПІСЛЯ `flush`, коли знімати було вже
+  нізвідки — див. "Виправлено" нижче.
 
 ### Змінено
 - Заводський дефолт `trusted` — тепер `127.0.0.0/8` замість `127.0.0.1`
@@ -151,6 +175,19 @@
   Block"`, `"Scan Detect"`, `"SynScan Level N"`, `"Service <stage>"`).
 
 ### Виправлено
+- **`systemctl stop scan-detector.service` не знімав таблицю `inet
+  scanDetector`.** Юніт `Type=oneshot` з `RemainAfterExit=yes` без
+  `ExecStop` на `stop` не виконує жодної команди — лише позначає себе
+  неактивним у systemd, реальний стан ядра (жива таблиця) лишався без
+  змін. Полагоджено додаванням `ExecStop` (див. "Додано" вище).
+- **Заявлене в CHANGELOG "live-стан переживає рестарт через drop-in на
+  `nftables.service`" насправді не виконувалось.** `ExecStartPost`
+  перезапускав `scan-detector.service` вже ПІСЛЯ того, як vendor's
+  `flush ruleset` стирав нашу таблицю — на момент запуску знімати живий
+  стан було вже нізвідки, каскад мовчки втрачався при кожному рестарті
+  `nftables.service` (ручному чи автоматичному). Полагоджено
+  `ExecStartPre` у самому drop-in (див. "Додано" вище) — знімок тепер
+  береться до того, як `flush` встигає щось стерти.
 - **Перший запуск на чистому хості завжди падав.** `nft -c -f` (dry-run
   перевірка синтаксису) не дозволяє `delete table`, якщо таблиці ще нема —
   а на щойно встановленому хості її й нема. Тепер перед `delete table`
