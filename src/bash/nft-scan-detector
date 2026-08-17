@@ -72,8 +72,11 @@
 # сети normal/check0/check1/block (throttle по saddr, не по протоколу).
 #
 # /etc/nft-scandetect/srv_timeouts — рядки "stage:timeout", рівно 4 стадії:
-# normal, check0, check1, block (дефолт 5s/10s/15s/1m). Неповний набір чи
-# невідома стадія — фолбек на дефолт з попередженням у stderr.
+# normal, check0, check1, block (дефолт 30s/10s/1m30s/1m). normal -- ковзне
+# вікно (update на кожному новому з'єднанні); небезпечна зона для block --
+# це check1-normal, від check0 не залежить (лише від того, чи потрапляє
+# джерело в check1 узагалі). Неповний набір чи невідома стадія — фолбек на
+# дефолт з попередженням у stderr.
 #
 # --stop і live-стан: на відміну від звичайного перестворення (де знімок і
 # відновлення відбуваються в одній транзакції), --stop лишає таблицю
@@ -109,8 +112,15 @@ LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
 # перевизначається опційним рядком "scan:timeout" у level_timeouts
 DEFAULT_SCAN_TIMEOUT=31d
 
-# srv_* сети: назва -> таймаут
-SRV_STAGES=(normal:5s check0:10s check1:15s block:1m)
+# srv_* сети: назва -> таймаут. normal -- ковзне вікно (update на кожному
+# новому з'єднанні, див. gen_srv_rules), тому має сенс саме як "як довго
+# тримається довіра з часу ОСТАННЬОГО заходу", а не сумарна тривалість сесії.
+# Різниця check1-normal -- ширина "небезпечної зони" (пауза після сплеску, що
+# ще веде в block); перевірено емпірично на реальних TCP: 30s/90s дають зону
+# 60s, у яку не потрапляє звичайний перегляд (гепи до 30s узагалі не сягають
+# check1), а обережний брутфорс з паузами довшими за normal все одно рано чи
+# пізно впаде в неї.
+SRV_STAGES=(normal:30s check0:10s check1:1m30s block:1m)
 
 # захищені порти для каскаду srv_*/srv6_* (те, що зараз "tcp dport { 80, 443 }")
 SRV_PORTS_DEFAULT=(tcp/80 tcp/443)
@@ -695,12 +705,20 @@ gen_srv_rules() {
     # gen_srv_rules CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
     # L4MATCH -- напр. "tcp dport { 80, 443 }"; кілька L4MATCH можуть ділити
     # ті самі normal/check0/check1/block (throttle по saddr, не по протоколу)
+    #
+    # srv_normal -- КОВЗНЕ вікно: update (не add) на кожному новому з'єднанні,
+    # доки джерело не в block -- освіжається щоразу, а не лише на першому
+    # заході. Небезпечна зона (пауза, після якої свіже з'єднання при ще
+    # живому check1 веде в block) -- це рівно check1 - normal; сам normal тут
+    # ні на що інше не впливає. Перший рядок раніше містив самосуперечливе
+    # "!= @check1 ... @check1" (ніколи не спрацьовувало, srv_block був мертвим
+    # кодом) -- виправлено на "!= @block".
     local chain="$1" proto="$2" prefix="$3" l4match="$4" ifm="${5:-}"
     local normal="${prefix}normal" c0="${prefix}check0" c1="${prefix}check1" block="${prefix}block"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${normal} add @${normal} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} update @${normal} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${normal} counter return"
 }
