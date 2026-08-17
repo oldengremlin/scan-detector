@@ -67,12 +67,23 @@
 # /etc/nft-scandetect/srv_timeouts — рядки "stage:timeout", рівно 4 стадії:
 # normal, check0, check1, block (дефолт 5s/10s/15s/1m). Неповний набір чи
 # невідома стадія — фолбек на дефолт з попередженням у stderr.
+#
+# --stop і live-стан: на відміну від звичайного перестворення (де знімок і
+# відновлення відбуваються в одній транзакції), --stop лишає таблицю
+# видаленою на невизначений час. Тому знімок перед видаленням лягає не лише
+# в АУДИТ (${AUDIT_DIR}/live-state-<ts>.tsv), а й у фіксований "відкладений"
+# файл ${AUDIT_DIR}/live-state-pending.tsv. Найперший наступний звичайний
+# запуск (systemctl start/restart чи просто nft-scan-detector без прапорців)
+# бачить цей файл, відновлює каскад із нього замість знімка живої таблиці
+# (якої вже нема) і видаляє файл — одноразове споживання. --reset-live-state
+# ігнорує й видаляє відкладений файл теж, не відновлюючи з нього.
 
 set -euo pipefail
 
 TABLE_FAMILY="inet"
 OVERRIDE_DIR="/etc/nft-scandetect"
 AUDIT_DIR="/var/lib/nft-scandetect"
+PENDING_STATE_FILE="${AUDIT_DIR}/live-state-pending.tsv"
 RESET_LIVE_STATE=0
 NO_DOCKER=0
 NO_IPV6=0
@@ -244,9 +255,14 @@ per-bridge правил заважає docker чисто "гаситись". Щ�
                         docker.socket та docker.service (у цьому порядку).
 
 --stop -- прибирає ${TABLE} із системи ПОВНІСТЮ (delete table: і input, і
-forward, і всі сети/live-стан). Хост і docker-мережі після цього нічим не
-захищені. Щоб повернути -- звичайний запуск (live-стан за час "простою"
-втрачається).
+forward, і всі сети). Хост і docker-мережі після цього нічим не захищені.
+Live-стан каскаду (scan/level*/srv_*) перед видаленням зберігається в
+${AUDIT_DIR}/live-state-pending.tsv і автоматично відновлюється при першому
+наступному звичайному запуску (systemctl start/restart чи просто
+nft-scan-detector без прапорців) -- незалежно від того, за скільки часу це
+станеться. Це і є ExecStop у scan-detector.service: "systemctl stop
+scan-detector.service" реально гасить таблицю, а не просто позначає юніт
+неактивним.
 
   --stop                Повністю видалити таблицю ${TABLE}, більше нічого
                         не робити.
@@ -883,16 +899,27 @@ do_stop_docker() {
 # --- --stop ---
 
 # Атомарно прибирає ${TABLE} із системи ПОВНІСТЮ (delete table -- і input, і
-# forward, і всі сети/live-стан ідуть разом з нею). На відміну від
-# do_stop_fwd, це залишає хост і docker-мережі зовсім без захисту
-# scanDetector-ом. Щоб повернути -- звичайний запуск nft-scan-detector
-# (перестворює таблицю з нуля, live-стан за час "простою" не відновити --
-# його просто нема, звідки брати).
+# forward, і всі сети йдуть разом з нею). На відміну від do_stop_fwd, це
+# залишає хост і docker-мережі зовсім без захисту scanDetector-ом. Live-стан
+# (scan/level*/srv_*) перед видаленням лягає у PENDING_STATE_FILE -- перший
+# наступний звичайний запуск (systemctl start/restart чи просто
+# nft-scan-detector без прапорців) підхопить його й відновить каскад.
 do_stop_all() {
     if ! sudo nft list table ${TABLE} >/dev/null 2>&1; then
         echo "Таблиця ${TABLE} відсутня -- нічого прибирати." >&2
         return 0
     fi
+
+    sudo mkdir -p "$AUDIT_DIR"
+    LIVE_STATE_FILE=$(mktemp /tmp/nft-scandetect.XXXXXX.state)
+    capture_live_state
+    if [[ -s "$LIVE_STATE_FILE" ]]; then
+        sudo cp "$LIVE_STATE_FILE" "$PENDING_STATE_FILE"
+        echo "Live-стан каскаду (scan/level*/srv_*) збережено -- відновиться при наступному запуску." >&2
+    else
+        sudo rm -f "$PENDING_STATE_FILE"
+    fi
+    rm -f "$LIVE_STATE_FILE"
 
     local tmpfile
     tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
@@ -907,7 +934,7 @@ do_stop_all() {
     sudo nft -f "$tmpfile"
     rm -f "$tmpfile"
     echo "Таблицю ${TABLE} прибрано. Хост і docker-мережі БІЛЬШЕ НЕ захищені scanDetector-ом." >&2
-    echo "Щоб повернути -- звичайний запуск nft-scan-detector." >&2
+    echo "Щоб повернути -- звичайний запуск nft-scan-detector (або systemctl start scan-detector.service)." >&2
 }
 
 # --- --init ---
@@ -929,8 +956,19 @@ main() {
     LIVE_STATE_FILE=$(mktemp /tmp/nft-scandetect.XXXXXX.state)
     trap 'rm -f "${tmpfile:-}" "${LIVE_STATE_FILE:-}"' EXIT
 
-    # знімок ПЕРЕД перестворенням таблиці -- поки жива таблиця ще не займана
-    capture_live_state
+    # Відкладений знімок від попереднього --stop (таблиці вже нема, знімати
+    # живий стан нема звідки) -- пріоритетне джерело, одноразове споживання.
+    # --reset-live-state ігнорує й прибирає його теж (явний запит почати з
+    # чистого). Інакше -- звичний шлях: знімок ПЕРЕД перестворенням таблиці,
+    # поки жива таблиця ще не займана.
+    if [[ $RESET_LIVE_STATE -eq 0 ]] && [[ -s "$PENDING_STATE_FILE" ]]; then
+        cp "$PENDING_STATE_FILE" "$LIVE_STATE_FILE"
+        sudo rm -f "$PENDING_STATE_FILE"
+        echo "Відновлюю live-стан із відкладеного знімка (залишеного попереднім --stop)." >&2
+    else
+        sudo rm -f "$PENDING_STATE_FILE"
+        capture_live_state
+    fi
     sudo cp "$LIVE_STATE_FILE" "${AUDIT_DIR}/live-state-${ts}.tsv"
 
     build_ruleset > "$tmpfile"
