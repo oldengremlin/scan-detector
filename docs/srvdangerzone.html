@@ -1,0 +1,584 @@
+<title>Небезпечна зона</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:        #f9f9f7;
+    --surface:     #fcfcfb;
+    --surface-2:   #f0efec;
+    --ink:         #0b0b0b;
+    --ink-2:       #52514e;
+    --ink-muted:   #898781;
+    --grid:        #e1e0d9;
+    --baseline:    #c3c2b7;
+    --border:      rgba(11,11,11,0.10);
+    --accent:      #2a78d6;
+    --accent-soft: #cde2fb;
+    --accent-ink:  #0d366b;
+    --good:        #0ca30c;
+    --good-soft:   #dff3df;
+    --good-ink:    #0a5a0a;
+    --critical:    #d03b3b;
+    --critical-soft: #fbe1e1;
+    --critical-ink:  #7a1f1f;
+    --warning:     #fab219;
+    --warning-soft:#fff1d1;
+    --warning-ink: #6b4a06;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page:        #0d0d0d;
+      --surface:     #1a1a19;
+      --surface-2:   #232320;
+      --ink:         #ffffff;
+      --ink-2:       #c3c2b7;
+      --ink-muted:   #8f8d87;
+      --grid:        #2c2c2a;
+      --baseline:    #383835;
+      --border:      rgba(255,255,255,0.12);
+      --accent:      #3987e5;
+      --accent-soft: #142a42;
+      --accent-ink:  #9ec5f4;
+      --good:        #0ca30c;
+      --good-soft:   #123a12;
+      --good-ink:    #6fdc6f;
+      --critical:    #e66767;
+      --critical-soft: #3a1414;
+      --critical-ink:  #ffb3b3;
+      --warning:     #fab219;
+      --warning-soft:#3a2c05;
+      --warning-ink: #ffcf70;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:        #0d0d0d;
+    --surface:     #1a1a19;
+    --surface-2:   #232320;
+    --ink:         #ffffff;
+    --ink-2:       #c3c2b7;
+    --ink-muted:   #8f8d87;
+    --grid:        #2c2c2a;
+    --baseline:    #383835;
+    --border:      rgba(255,255,255,0.12);
+    --accent:      #3987e5;
+    --accent-soft: #142a42;
+    --accent-ink:  #9ec5f4;
+    --good:        #0ca30c;
+    --good-soft:   #123a12;
+    --good-ink:    #6fdc6f;
+    --critical:    #e66767;
+    --critical-soft: #3a1414;
+    --critical-ink:  #ffb3b3;
+    --warning:     #fab219;
+    --warning-soft:#3a2c05;
+    --warning-ink: #ffcf70;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 840px;
+    margin: 0 auto;
+    padding: 48px 24px 96px;
+    display: flex;
+    flex-direction: column;
+    gap: 40px;
+  }
+
+  header.page-head {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    width: fit-content;
+  }
+  h1 {
+    font-size: 32px;
+    line-height: 1.15;
+    margin: 0;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+  .lede {
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--ink-2);
+    max-width: 62ch;
+    margin: 0;
+  }
+  .lede code { font-family: var(--mono); font-size: 0.92em; }
+
+  .params-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .param-chip {
+    font-family: var(--mono);
+    font-size: 13px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 6px 10px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    color: var(--ink-2);
+  }
+  .param-chip b { color: var(--ink); font-weight: 700; }
+  .param-chip .fixed-tag {
+    font-family: var(--sans);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+  }
+
+  section.card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 28px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+  .card-head { display: flex; flex-direction: column; gap: 6px; }
+  h2 {
+    font-size: 19px;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .card-note {
+    font-size: 13.5px;
+    color: var(--ink-2);
+    line-height: 1.55;
+    margin: 0;
+    max-width: 68ch;
+  }
+  .card-note code { font-family: var(--mono); font-size: 0.94em; }
+
+  /* ---- Danger zone chart ---- */
+  .zone-chart { display: flex; flex-direction: column; gap: 14px; }
+  .zone-axis {
+    position: relative;
+    height: 22px;
+    margin-left: 132px;
+    border-bottom: 1px solid var(--baseline);
+  }
+  .zone-axis .tick {
+    position: absolute;
+    bottom: 0;
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: var(--ink-muted);
+    transform: translateX(-50%);
+    padding-bottom: 4px;
+    border-left: 1px solid var(--grid);
+    height: 8px;
+    padding-left: 4px;
+  }
+  .zone-row { display: flex; align-items: center; gap: 0; }
+  .zone-label {
+    width: 132px;
+    flex: none;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--ink);
+    text-align: right;
+    padding-right: 14px;
+  }
+  .zone-label .w {
+    display: block;
+    font-family: var(--sans);
+    font-size: 10.5px;
+    color: var(--ink-muted);
+    margin-top: 1px;
+  }
+  .zone-track {
+    position: relative;
+    flex: 1;
+    height: 34px;
+  }
+  .zone-seg {
+    position: absolute;
+    top: 6px;
+    height: 22px;
+    border-radius: 4px;
+  }
+  .zone-seg.safe { background: var(--good-soft); border: 1px solid color-mix(in srgb, var(--good) 45%, transparent); }
+  .zone-seg.danger {
+    background: repeating-linear-gradient(135deg, var(--critical-soft) 0 6px, color-mix(in srgb, var(--critical-soft) 60%, var(--surface)) 6px 12px);
+    border: 1px solid color-mix(in srgb, var(--critical) 45%, transparent);
+  }
+  .zone-marker {
+    position: absolute;
+    top: 0;
+    width: 2px;
+    height: 34px;
+    background: var(--ink-muted);
+  }
+  .zone-marker.normal-end { background: var(--ink); }
+  .zone-dot {
+    position: absolute;
+    top: 3px;
+    width: 15px;
+    height: 15px;
+    border-radius: 50%;
+    border: 2.5px solid var(--surface);
+    transform: translateX(-50%);
+    cursor: default;
+  }
+  .zone-dot.ok { background: var(--good); }
+  .zone-dot.blocked { background: var(--critical); }
+
+  .zone-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    padding-top: 4px;
+    border-top: 1px solid var(--grid);
+    margin-top: 4px;
+    font-size: 12.5px;
+    color: var(--ink-2);
+  }
+  .zone-legend .item { display: flex; align-items: center; gap: 7px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .swatch.dot { border-radius: 50%; }
+
+  /* ---- check0 grid ---- */
+  .c0-grid {
+    display: grid;
+    grid-template-columns: 90px repeat(3, 1fr);
+    border: 1px solid var(--grid);
+    border-radius: 8px;
+    overflow: hidden;
+    font-size: 13.5px;
+  }
+  .c0-grid .cell {
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-top: 1px solid var(--grid);
+    border-left: 1px solid var(--grid);
+  }
+  .c0-grid .cell:nth-child(-n+4) { border-top: none; }
+  .c0-grid .cell.hd {
+    background: var(--surface-2);
+    font-family: var(--mono);
+    font-weight: 700;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .c0-grid .cell.rowhd {
+    background: var(--surface-2);
+    font-family: var(--mono);
+    font-weight: 700;
+    border-left: none;
+    justify-content: flex-end;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    padding-right: 14px;
+  }
+  .pill {
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    padding: 4px 9px;
+    border-radius: 100px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+  }
+  .pill.warn { background: var(--warning-soft); color: var(--warning-ink); }
+  .pill.safe { background: var(--good-soft); color: var(--good-ink); }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; }
+  .pill.warn::before { background: var(--warning); }
+  .pill.safe::before { background: var(--good); }
+
+  /* ---- code block ---- */
+  pre.code {
+    margin: 0;
+    background: var(--surface-2);
+    border: 1px solid var(--grid);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 12.3px;
+    line-height: 1.7;
+    color: var(--ink);
+  }
+  pre.code .kw { color: var(--accent-ink); }
+  pre.code .set { color: var(--critical-ink); }
+  pre.code .cm { color: var(--ink-muted); }
+
+  /* ---- conclusion ---- */
+  .conclusion {
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    border-radius: 12px;
+    padding: 24px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .conclusion h2 { color: var(--accent-ink); }
+  .conclusion .lede { color: var(--ink); }
+  .final-values {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .final-values .v {
+    font-family: var(--mono);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 84px;
+  }
+  .final-values .v .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-muted); font-family: var(--sans); }
+  .final-values .v .n { font-size: 18px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  footer.meta {
+    font-size: 12.5px;
+    color: var(--ink-muted);
+    line-height: 1.6;
+    border-top: 1px solid var(--grid);
+    padding-top: 18px;
+  }
+
+  @media (max-width: 600px) {
+    .zone-axis, .zone-label { margin-left: 0; width: 84px; }
+    .zone-label { font-size: 11.5px; }
+    .c0-grid { font-size: 12px; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="page-head">
+    <span class="eyebrow">🚧 srv_normal / check0 / check1 / block</span>
+    <h1>Скільки триває небезпечна зона</h1>
+    <p class="lede">
+      Емпіричний вимір каскаду <code>srv_*</code> у <code>scan-detector</code>: після
+      правки <code>srv_block</code> (замість самосуперечливого правила) і переходу
+      <code>srv_normal</code> на ковзне вікно (<code>update</code> замість <code>add</code>),
+      блокування можливе лише в проміжку між тим, як «згасне» <code>normal</code>,
+      і тим, як згасне <code>check1</code>. Нижче — де саме ця зона починається
+      і закінчується для різних значень <code>check1</code>, і наскільки чутливий
+      поріг «сплеску» <code>check0</code>. Усі точки — реальні TCP-з'єднання на
+      живому <code>nft</code>, не розрахунок на папері.
+    </p>
+    <div class="params-row">
+      <span class="param-chip"><span class="fixed-tag">фіксовано</span> <b>normal = 30s</b></span>
+      <span class="param-chip"><span class="fixed-tag">фіксовано</span> <b>block = 1m</b></span>
+    </div>
+  </header>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Небезпечна зона = check1 − normal</h2>
+      <p class="card-note">
+        Кожен рядок — окреме значення <code>check1</code>. Зелена ділянка [0…30s] —
+        безпечно (перевірено паузою 25s). Заштрихована червона ділянка — небезпечна
+        зона: пауза десь усередині неї (позначена крапкою) реально призводила до
+        <code>srv_block</code>. Ширина зони не залежала від <code>check0</code> —
+        перевірено на трьох різних його значеннях (10s / 20s / 30s), результат
+        ідентичний у всіх випадках.
+      </p>
+    </div>
+
+    <div class="zone-chart">
+      <div class="zone-axis" id="axis"></div>
+      <!-- rows generated below -->
+      <div id="zone-rows"></div>
+      <div class="zone-legend">
+        <span class="item"><span class="swatch" style="background:var(--good-soft);border:1px solid var(--good)"></span> безпечна ділянка (0–30s)</span>
+        <span class="item"><span class="swatch" style="background:var(--critical-soft);border:1px solid var(--critical)"></span> небезпечна зона</span>
+        <span class="item"><span class="swatch dot" style="background:var(--good)"></span> тест-точка: не заблоковано</span>
+        <span class="item"><span class="swatch dot" style="background:var(--critical)"></span> тест-точка: заблоковано</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Поріг «сплеску»: коли <code>check0</code> вважає два з'єднання одним заходом</h2>
+      <p class="card-note">
+        Два TCP-з'єднання з паузою <b>GAP</b> між ними; чи потрапляє джерело в
+        <code>srv_check1</code>, залежить лише від того, чи встиг протухнути
+        <code>srv_check0</code> — тобто чи <b>GAP &lt; check0</b>. Монотонний поріг,
+        без сюрпризів, і саме тому <code>check0</code> не впливає на ширину зони
+        вище — він лише вирішує, кого туди взагалі пускають.
+      </p>
+    </div>
+    <div class="c0-grid">
+      <div class="cell hd">check0 \ gap</div>
+      <div class="cell hd">8s</div>
+      <div class="cell hd">15s</div>
+      <div class="cell hd">25s</div>
+
+      <div class="cell rowhd">10s</div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+      <div class="cell"><span class="pill safe">окремо</span></div>
+      <div class="cell"><span class="pill safe">окремо</span></div>
+
+      <div class="cell rowhd">20s</div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+      <div class="cell"><span class="pill safe">окремо</span></div>
+
+      <div class="cell rowhd">30s</div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+      <div class="cell"><span class="pill warn">сплеск</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Чинні правила <code>{ 80, 443 }</code></h2>
+      <p class="card-note">Точний вивід <code>scan-detect-tool --show | grep "{ 80, 443 }"</code> для рекомендованої конфігурації нижче.</p>
+    </div>
+    <pre class="code">tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr != @<span class="set">srv_block</span> ip saddr != @<span class="set">srv_normal</span> ip saddr @<span class="set">srv_check1</span> add @<span class="set">srv_block</span> { ip saddr } counter
+tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr != @<span class="set">srv_check1</span> ip saddr @<span class="set">srv_check0</span> add @<span class="set">srv_check1</span> { ip saddr } counter
+tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr != @<span class="set">srv_check0</span> add @<span class="set">srv_check0</span> { ip saddr } counter
+tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr != @<span class="set">srv_block</span> update @<span class="set">srv_normal</span> { ip saddr } counter  <span class="cm">← ковзне вікно</span>
+tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr @<span class="set">srv_block</span> update @<span class="set">srv_block</span> { ip saddr } counter drop
+tcp dport { 80, 443 } <span class="kw">ct state new</span> ip saddr @<span class="set">srv_normal</span> counter return</pre>
+  </section>
+
+  <section class="conclusion">
+    <h2>Підсумок</h2>
+    <p class="lede">
+      <code>check1 = 90s</code> дає зону шириною 60s — досить вузьку, щоб не чіпати
+      звичний перегляд (гепи до 30s узагалі не сягають <code>check1</code>), і досить
+      широку, щоб «сплеск + випадкова пауза на каву» не був типовим бита патерном.
+      <code>check0 = 10s</code> лишається найтуманнішим (лише справді швидкі
+      довантаження сторінки рахуються сплеском) — саме тому обраний як нижня межа
+      набору вище.
+    </p>
+    <div class="final-values">
+      <div class="v"><span class="k">normal</span><span class="n">30s</span></div>
+      <div class="v"><span class="k">check0</span><span class="n">10s</span></div>
+      <div class="v"><span class="k">check1</span><span class="n">1m30s</span></div>
+      <div class="v"><span class="k">block</span><span class="n">1m</span></div>
+    </div>
+  </section>
+
+  <footer class="meta">
+    Методологія: реальні TCP-з'єднання на 127.0.0.1 проти живого <code>nft</code>
+    у пісочниці (не симуляція), <code>trusted</code> тимчасово очищено від
+    <code>127.0.0.0/8</code> на час тестів, кожна конфігурація самоперевірена
+    (<code>nft list set</code>) перед вимірюванням, щоб виключити застарілий
+    override-файл. Дані: 9 точок на поріг <code>check0</code>, 8 комбінацій на
+    підтвердження формули зони.
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  var NORMAL = 30;
+  var AXIS_MAX = 125;
+  var rows = [
+    { check1: 45,  mid: 37, safe: 25 },
+    { check1: 60,  mid: 45, safe: 25 },
+    { check1: 90,  mid: 60, safe: 25 },
+    { check1: 120, mid: 75, safe: 25 }
+  ];
+
+  function pct(s) { return (s / AXIS_MAX * 100).toFixed(2) + '%'; }
+
+  var axis = document.getElementById('axis');
+  [0, 15, 30, 45, 60, 75, 90, 105, 120].forEach(function (t) {
+    var d = document.createElement('div');
+    d.className = 'tick';
+    d.style.left = pct(t);
+    d.textContent = t + 's';
+    axis.appendChild(d);
+  });
+
+  var container = document.getElementById('zone-rows');
+  rows.forEach(function (r) {
+    var row = document.createElement('div');
+    row.className = 'zone-row';
+
+    var label = document.createElement('div');
+    label.className = 'zone-label';
+    label.innerHTML = 'check1 = ' + r.check1 + 's<span class="w">шир. ' + (r.check1 - NORMAL) + 's</span>';
+    row.appendChild(label);
+
+    var track = document.createElement('div');
+    track.className = 'zone-track';
+
+    var safe = document.createElement('div');
+    safe.className = 'zone-seg safe';
+    safe.style.left = pct(0);
+    safe.style.width = pct(NORMAL);
+    track.appendChild(safe);
+
+    var danger = document.createElement('div');
+    danger.className = 'zone-seg danger';
+    danger.style.left = pct(NORMAL);
+    danger.style.width = pct(r.check1 - NORMAL);
+    track.appendChild(danger);
+
+    var endMarker = document.createElement('div');
+    endMarker.className = 'zone-marker normal-end';
+    endMarker.style.left = pct(NORMAL);
+    track.appendChild(endMarker);
+
+    var c1Marker = document.createElement('div');
+    c1Marker.className = 'zone-marker';
+    c1Marker.style.left = pct(r.check1);
+    track.appendChild(c1Marker);
+
+    var safeDot = document.createElement('div');
+    safeDot.className = 'zone-dot ok';
+    safeDot.style.left = pct(r.safe);
+    safeDot.title = 'пауза ' + r.safe + 's -> не заблоковано';
+    track.appendChild(safeDot);
+
+    var blockDot = document.createElement('div');
+    blockDot.className = 'zone-dot blocked';
+    blockDot.style.left = pct(r.mid);
+    blockDot.title = 'пауза ' + r.mid + 's -> заблоковано (srv_block)';
+    track.appendChild(blockDot);
+
+    row.appendChild(track);
+    container.appendChild(row);
+  });
+})();
+</script>
