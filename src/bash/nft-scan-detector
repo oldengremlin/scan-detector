@@ -36,6 +36,13 @@
 #   /etc/nft-scandetect/ignore6-extra.list
 #   /etc/nft-scandetect/permanent6-extra.list
 #
+# /etc/nft-scandetect/extra_forward_ifaces — той самий формат (по одному
+# імені інтерфейсу на рядок), порожньо за замовчуванням. Транзитні (не
+# docker) інтерфейси, які отримують ТІ САМІ forward-правила відстеження
+# сканування, що й docker-бриджі (get_docker_bridges) -- напр. роутинг
+# eno0<->eno1 без Docker узагалі. Редагується вручну, scan-detect-tool цим
+# списком не керує.
+#
 # /etc/nft-scandetect/priority — окремий формат: РІВНО одне ціле число,
 # без коментарів (читається через `head -1`). Пріоритет hook'ів input/forward
 # (дефолт -50). Нелегітимне значення чи відсутній файл — фолбек на дефолт із
@@ -65,8 +72,11 @@
 # сети normal/check0/check1/block (throttle по saddr, не по протоколу).
 #
 # /etc/nft-scandetect/srv_timeouts — рядки "stage:timeout", рівно 4 стадії:
-# normal, check0, check1, block (дефолт 5s/10s/15s/1m). Неповний набір чи
-# невідома стадія — фолбек на дефолт з попередженням у stderr.
+# normal, check0, check1, block (дефолт 30s/10s/1m30s/1m). normal -- ковзне
+# вікно (update на кожному новому з'єднанні); небезпечна зона для block --
+# це check1-normal, від check0 не залежить (лише від того, чи потрапляє
+# джерело в check1 узагалі). Неповний набір чи невідома стадія — фолбек на
+# дефолт з попередженням у stderr.
 #
 # --stop і live-стан: на відміну від звичайного перестворення (де знімок і
 # відновлення відбуваються в одній транзакції), --stop лишає таблицю
@@ -102,8 +112,15 @@ LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
 # перевизначається опційним рядком "scan:timeout" у level_timeouts
 DEFAULT_SCAN_TIMEOUT=31d
 
-# srv_* сети: назва -> таймаут
-SRV_STAGES=(normal:5s check0:10s check1:15s block:1m)
+# srv_* сети: назва -> таймаут. normal -- ковзне вікно (update на кожному
+# новому з'єднанні, див. gen_srv_rules), тому має сенс саме як "як довго
+# тримається довіра з часу ОСТАННЬОГО заходу", а не сумарна тривалість сесії.
+# Різниця check1-normal -- ширина "небезпечної зони" (пауза після сплеску, що
+# ще веде в block); перевірено емпірично на реальних TCP: 30s/90s дають зону
+# 60s, у яку не потрапляє звичайний перегляд (гепи до 30s узагалі не сягають
+# check1), а обережний брутфорс з паузами довшими за normal все одно рано чи
+# пізно впаде в неї.
+SRV_STAGES=(normal:30s check0:10s check1:1m30s block:1m)
 
 # захищені порти для каскаду srv_*/srv6_* (те, що зараз "tcp dport { 80, 443 }")
 SRV_PORTS_DEFAULT=(tcp/80 tcp/443)
@@ -221,10 +238,13 @@ usage() {
                         відновлення). За замовчуванням live-стан
                         (scan/level0..level15/srv_* і IPv6-відповідники)
                         переживає перестворення таблиці.
-  --no-docker           Не генерувати ланцюг forward і per-bridge правила --
-                        лишається тільки input. Активується й автоматично,
-                        якщо бінарника docker немає на хості. Незалежний від
-                        --reset-live-state -- прапорці вільно комбінуються.
+  --no-docker           Не підхоплювати docker-бриджі автоматично. Ланцюг
+                        forward усе одно будується, якщо є хоч один
+                        інтерфейс з ${OVERRIDE_DIR}/extra_forward_ifaces --
+                        інакше лишається тільки input. Активується й
+                        автоматично, якщо бінарника docker немає на хості.
+                        Незалежний від --reset-live-state -- прапорці
+                        вільно комбінуються.
   --no-ipv6              Не генерувати жодних v6-сетів/правил (trusted6,
                         ignore6, permanentBlock6, level6_*, srv6_*, scan6,
                         ip6-правила в input і в кожному forward). Разовий
@@ -321,7 +341,7 @@ fi
 # собою, без потреби пам'ятати про прапорець. В окремих режимах це не має
 # значення -- взагалі не чіпаємо docker тут.
 if [[ $STANDALONE_MODES -eq 0 && $NO_DOCKER -eq 0 ]] && ! command -v docker >/dev/null 2>&1; then
-    echo "Docker не знайдено на хості -- forward-правила не генеруються (як --no-docker)." >&2
+    echo "Docker не знайдено на хості -- docker-бриджі автоматично не підхоплюються (як --no-docker); forward усе одно збудується, якщо є ${OVERRIDE_DIR}/extra_forward_ifaces." >&2
     NO_DOCKER=1
 fi
 
@@ -637,6 +657,25 @@ get_docker_bridges() {
     done | sort -u
 }
 
+# Читає ${OVERRIDE_DIR}/extra_forward_ifaces -- по одному імені інтерфейсу
+# на рядок, коментарі через #. Це транзитні (не-docker) інтерфейси, які
+# отримують ТІ САМІ forward-правила, що й docker-бриджі (та сама побудова
+# ifm="iifname != IFACE oifname IFACE" у build_ruleset нижче) -- єдина
+# відмінність від get_docker_bridges вище лише в джерелі списку. Неіснуючий
+# інтерфейс -- попередження в stderr і пропуск, решта застосовується.
+read_extra_forward_ifaces() {
+    local file="${OVERRIDE_DIR}/extra_forward_ifaces" iface
+    [[ -f "$file" ]] || return 0
+    (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' | while read -r iface; do
+        [[ -z "$iface" ]] && continue
+        if ip link show "$iface" &>/dev/null; then
+            echo "$iface"
+        else
+            echo "УВАГА: інтерфейс '$iface' з ${file} не знайдено в 'ip link' -- пропускаю." >&2
+        fi
+    done
+}
+
 # --- генератори фрагментів nft-синтаксису ---
 
 gen_level_sets() {
@@ -666,12 +705,20 @@ gen_srv_rules() {
     # gen_srv_rules CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
     # L4MATCH -- напр. "tcp dport { 80, 443 }"; кілька L4MATCH можуть ділити
     # ті самі normal/check0/check1/block (throttle по saddr, не по протоколу)
+    #
+    # srv_normal -- КОВЗНЕ вікно: update (не add) на кожному новому з'єднанні,
+    # доки джерело не в block -- освіжається щоразу, а не лише на першому
+    # заході. Небезпечна зона (пауза, після якої свіже з'єднання при ще
+    # живому check1 веде в block) -- це рівно check1 - normal; сам normal тут
+    # ні на що інше не впливає. Перший рядок раніше містив самосуперечливе
+    # "!= @check1 ... @check1" (ніколи не спрацьовувало, srv_block був мертвим
+    # кодом) -- виправлено на "!= @block".
     local chain="$1" proto="$2" prefix="$3" l4match="$4" ifm="${5:-}"
     local normal="${prefix}normal" c0="${prefix}check0" c1="${prefix}check1" block="${prefix}block"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${normal} add @${normal} { ${proto} saddr } counter"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} update @${normal} { ${proto} saddr } counter"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${normal} counter return"
 }
@@ -723,6 +770,30 @@ gen_static_guard6_rules() {
     echo "add rule ${TABLE} ${chain} ${ifm}ct state new ip6 saddr @ignore6 counter return"
 }
 
+# ${OVERRIDE_DIR}/extra_forward_ifaces -- порожньо за замовчуванням (немає
+# заводських фізичних інтерфейсів, на відміну від trusted/ignore). Формат
+# той самий, що й в extra.list -- по одному значенню (тут: імені
+# інтерфейсу) на рядок, коментарі через #. Власний seed (не generic
+# seed_if_missing) -- той пише "керуйте через scan-detect-tool", а цей файл
+# редагується вручну, scan-detect-tool ним не керує.
+seed_extra_forward_ifaces_if_missing() {
+    local file="${OVERRIDE_DIR}/extra_forward_ifaces"
+    [[ -f "$file" ]] && return 0
+    sudo mkdir -p "$OVERRIDE_DIR"
+    {
+        echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S')."
+        echo "# Порожньо за замовчуванням. forward-правила scanDetector -- це відстеження"
+        echo "# ТРАНЗИТНОГО трафіку на потенційне сканування (той самий принцип, що й для"
+        echo "# input), а не дозвіл/заборона transit-трафіку як такого (те -- окрема"
+        echo "# турбота іншого hook'а/таблиці, див. README). За замовчуванням транзитні"
+        echo "# інтерфейси беруться лише з docker-мереж (get_docker_bridges). Щоб додати"
+        echo "# під той самий захист ще й фізичні (не-docker) інтерфейси -- напр. роутинг"
+        echo "# eno0 <-> eno1 без Docker узагалі -- по одному імені інтерфейсу на рядок."
+        echo "# Кожен отримує ідентичні forward-правила, що й docker-бридж. Редагується"
+        echo "# вручну -- scan-detect-tool цим списком не керує."
+    } | sudo tee "$file" >/dev/null
+}
+
 # Сіє всі override-файли, яких ще нема, вбудованими дефолтами -- щоб
 # /etc/nft-scandetect завжди відображав актуальний стан, а не приховані в
 # коді дефолти. Спільна для build_ruleset (перед генерацією) і --init
@@ -740,6 +811,7 @@ seed_all_config_if_missing() {
     seed_level_timeouts_if_missing
     seed_srv_ports_if_missing
     seed_srv_timeouts_if_missing
+    seed_extra_forward_ifaces_if_missing
 }
 
 # --- побудова повного ruleset ---
@@ -836,9 +908,14 @@ build_ruleset() {
         gen_level_rules input ip6 level6_ scan6
     fi
 
-    # --- forward: тільки якщо Docker не вимкнено -- інакше ланцюга forward
-    # у таблиці взагалі нема, і hook forward цю таблицю не чіпає
-    [[ $NO_DOCKER -eq 1 ]] && return 0
+    # --- forward: тільки якщо є ХОЧ ОДИН інтерфейс для захисту -- docker-бридж
+    # (якщо Docker не вимкнено) чи ручний з extra_forward_ifaces. Інакше
+    # ланцюга forward у таблиці взагалі нема, і hook forward цю таблицю не
+    # чіпає. NO_DOCKER більше не означає "forward не будується взагалі" --
+    # лише "docker-бриджі автоматично не підхоплюються".
+    local forward_ifaces
+    forward_ifaces=$( { [[ $NO_DOCKER -eq 0 ]] && get_docker_bridges; read_extra_forward_ifaces; } | sort -u)
+    [[ -z "$forward_ifaces" ]] && return 0
 
     echo "add chain ${TABLE} forward { type filter hook forward priority ${priority}; }"
 
@@ -851,15 +928,15 @@ build_ruleset() {
         gen_srv_rules_all_ports forward ip srv_ "$ifm"
         gen_level_rules forward ip level scan "$ifm"
 
-        # ipv6 для forward -- і глобально не вимкнено, і саме на ЦЬОМУ bridge
-        # IPv6 увімкнено (кожен bridge перевіряється окремо, незалежно від
-        # сусідніх -- один без IPv6 не позначається на решті)
+        # ipv6 для forward -- і глобально не вимкнено, і саме на ЦЬОМУ
+        # інтерфейсі IPv6 увімкнено (кожен інтерфейс перевіряється окремо,
+        # незалежно від сусідніх -- один без IPv6 не позначається на решті)
         if [[ $NO_IPV6 -eq 0 ]] && ipv6_enabled_for_iface "$iface"; then
             gen_static_guard6_rules forward "$ifm"
             gen_srv_rules_all_ports forward ip6 srv6_ "$ifm"
             gen_level_rules forward ip6 level6_ scan6 "$ifm"
         fi
-    done < <(get_docker_bridges)
+    done <<< "$forward_ifaces"
     return 0
 }
 
