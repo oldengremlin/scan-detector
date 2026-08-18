@@ -240,10 +240,10 @@ block:1m
    скількох завгодно правилах), спроба повторно послатись на той самий
    `meter` у ДРУГОМУ правилі — навіть побайтово ідентичному — падає з
    `Error: Operation not supported` / `Device or resource busy`. Перевірено
-   емпірично (два правила з однаковим `meter srv_conn {...}` для tcp й
+   емпірично (два правила з однаковим `meter srv_over {...}` для tcp й
    udp групи). Наслідок: кожна (chain × bridge × протокол-група)
    комбінація мусить мати СВІЙ, унікально названий `meter`
-   (`srv_rl_N`/`srv_conn_N`, `N` — монотонний лічильник) — throttle
+   (`srv_rl_N`/`srv_over_N`, `N` — монотонний лічильник) — throttle
    більше не один спільний бюджет на все джерело, а окремий на кожну
    комбінацію. `srv_block` (звичайний `set`) лишається спільним — це
    свідомо визнано важливішим за спільність самого лічильника.
@@ -268,7 +268,7 @@ block:1m
 
 ```
 tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter drop
-tcp dport { 80, 443 } ct state new meter srv_conn_0 { ip saddr ct count over 20 } add @srv_block { ip saddr } counter drop
+tcp dport { 80, 443 } ct state new meter srv_over_0 { ip saddr ct count over 20 } add @srv_block { ip saddr } counter drop
 tcp dport { 80, 443 } ct state new meter srv_rl_0 { ip saddr limit rate 20/minute burst 5 packets } counter return
 tcp dport { 80, 443 } ct state new ip saddr != @srv_block add @srv_block { ip saddr } counter drop
 ```
@@ -280,23 +280,23 @@ tcp dport { 80, 443 } ct state new ip saddr != @srv_block add @srv_block { ip sa
 (за яку `meter` встиг би відновити токени) під час активного блоку —
 спроба все одно дропнута.
 
-### Обрані дефолти `srv_limits`
+### Обрані дефолти `srv_timeouts`
 
 ```
 rate:20/minute
 burst:5
-conn:20
+over:20
 block:1m
 ```
 
 `rate`/`burst` узяті з порівняльного прогону вище (показали й м'якість, і
-суворість одночасно). `conn:20` — узятий орієнтовно, за аналогією; окремого
+суворість одночасно). `over:20` — узятий орієнтовно, за аналогією; окремого
 тюнінг-раунду (як для `rate`/`burst`) для нього поки не проводилось —
 кандидат на майбутнє, якщо з'явиться практична потреба.
 
 ### Відомі нюанси нової моделі
 
-- **`meter`-лічильники (`rate`/`conn`) не потрапляють у live-state
+- **`meter`-лічильники (`rate`/`over`) не потрапляють у live-state
   capture/restore.** `nft -j list table` віддає їх під ключем `"meter"`,
   не `"set"` — `capture_live_state()` фільтрує саме `.set?`. Наслідок:
   після кожного `regen`/`restart` лічильники стартують "з нуля", а

@@ -178,14 +178,14 @@
   каскаду наживо.
 - **Захист `srv_*` повністю переписано на нативні `nftables meter`**
   (`limit rate` + `ct count`) замість сетового каскаду
-  `srv_normal`/`check0`/`check1`. Новий `/etc/nft-scandetect/srv_limits`
-  (замінює `srv_timeouts`): `rate:20/minute burst:5 conn:20 block:1m`.
+  `srv_normal`/`check0`/`check1`. `/etc/nft-scandetect/srv_timeouts` (та
+  сама назва файлу, вміст інший): `rate:20/minute burst:5 over:20 block:1m`.
   Перевищення `rate` (нових з'єднань за час, token bucket з дозволеним
-  `burst`) чи `conn` (одночасних з'єднань, `ct count over N`) веде в
+  `burst`) чи `over` (одночасних з'єднань, `ct count over N`) веде в
   спільний `srv_block`/`srv6_block` (`update` на повторних спробах, як і
   раніше). `gen_srv_sets` → `gen_srv_block_set` (створює лише сам `block`);
   `gen_srv_rules` тепер генерує унікально названі `meter` (`srv_rl_N`/
-  `srv_conn_N`, `N` — монотонний `SRV_METER_IDX`) — nftables не дозволяє
+  `srv_over_N`, `N` — монотонний `SRV_METER_IDX`) — nftables не дозволяє
   повторне використання іменованого `meter` у різних правилах (на відміну
   від `set`), тож кожна (chain × bridge × протокол-група) комбінація має
   власний, незалежний бюджет; спільним лишається лише `srv_block`. Повне
@@ -194,7 +194,7 @@
   реакція на очевидну атаку) — розділ "Заміна на `meter`-модель" у
   [TESTS.md](TESTS.md). Відомий нюанс: `meter` не потрапляє в live-state
   capture/restore (`nft -j` віддає його не як `set`) — лічильники `rate`/
-  `conn` скидаються на кожному regen/restart, `srv_block` — ні.
+  `over` скидаються на кожному regen/restart, `srv_block` — ні.
 
 ### Змінено
 - **`srv_normal` тепер ковзне вікно** (`update` на кожному новому з'єднанні
