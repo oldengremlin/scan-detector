@@ -192,6 +192,41 @@ ct state new ip saddr != @srv_check1 ip saddr != @srv_normal ip saddr @srv_check
 
 ## Обрані дефолти каскаду (історичні — каскад більше не використовується)
 
+### Історичні правила (`{ 80, 443 }`, реально застосовані й перевірені)
+
+Для довідки (раптом повернемося) — реальний вивід `nft list ruleset` для
+каскаду, `chain input` (свіжа таблиця, лічильники нульові) і `forward` для
+одного docker bridge (той самий трафік, що вже встиг пройти — лічильники
+ненульові, видно порядок спрацювання правил за пакетами/байтами):
+
+```
+tcp dport { 80, 443 } ct state new ip saddr != @srv_block ip saddr != @srv_normal ip saddr @srv_check1 add @srv_block { ip saddr } counter packets 0 bytes 0
+tcp dport { 80, 443 } ct state new ip saddr != @srv_check1 ip saddr @srv_check0 add @srv_check1 { ip saddr } counter packets 0 bytes 0
+tcp dport { 80, 443 } ct state new ip saddr != @srv_check0 add @srv_check0 { ip saddr } counter packets 0 bytes 0
+tcp dport { 80, 443 } ct state new ip saddr != @srv_block update @srv_normal { ip saddr } counter packets 0 bytes 0
+tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter packets 0 bytes 0 drop
+tcp dport { 80, 443 } ct state new ip saddr @srv_normal counter packets 0 bytes 0 return
+
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr != @srv_block ip saddr != @srv_normal ip saddr @srv_check1 add @srv_block { ip saddr } counter packets 1120 bytes 67084
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr != @srv_check1 ip saddr @srv_check0 add @srv_check1 { ip saddr } counter packets 2432 bytes 144600
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr != @srv_check0 add @srv_check0 { ip saddr } counter packets 21245 bytes 1267624
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr != @srv_block update @srv_normal { ip saddr } counter packets 23180 bytes 1380284
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter packets 16044 bytes 960904 drop
+iifname != "br-91a0714957ed" oifname "br-91a0714957ed" tcp dport { 80, 443 } ct state new ip saddr @srv_normal counter packets 23180 bytes 1380284 return
+```
+
+Порядок правил — власне і є вся логіка каскаду: спершу перевірка ескалації
+в `srv_block` (з `srv_check1`), потім ескалація `srv_check0` → `srv_check1`,
+потім перше влучання в `srv_check0`, потім оновлення `srv_normal` (ковзне
+вікно, `update`), потім сам `srv_block` (`drop`), і нарешті `return` для
+вже "нормального" джерела. На відміну від `meter`-моделі нижче, тут увесь
+каскад — звичайні `set` (не `meter`), тож жодних обмежень на повторне
+використання імені між `input` і кожним `forward`-бриджем нема — але саме
+через це лічильники `srv_normal`/`srv_check0`/`srv_check1` були СПІЛЬНИМИ
+для `input` і всіх bridge разом (на відміну від нової моделі, де `rate`/
+`over` per-(chain × bridge × протокол-група), а спільний лишається лише
+`srv_block`).
+
 ```
 normal:30s
 check0:10s
