@@ -68,15 +68,33 @@
 #
 # /etc/nft-scandetect/srv_ports — рядки "proto/port" (tcp або udp), захищені
 # порти для каскаду srv_*/srv6_* (дефолт tcp/80, tcp/443). Кілька портів
-# одного протоколу йдуть в один dport-матч; usі протоколи пишуть у ТІ САМІ
-# сети normal/check0/check1/block (throttle по saddr, не по протоколу).
+# одного протоколу йдуть в один dport-матч (одну "групу").
 #
-# /etc/nft-scandetect/srv_timeouts — рядки "stage:timeout", рівно 4 стадії:
-# normal, check0, check1, block (дефолт 30s/10s/1m30s/1m). normal -- ковзне
-# вікно (update на кожному новому з'єднанні); небезпечна зона для block --
-# це check1-normal, від check0 не залежить (лише від того, чи потрапляє
-# джерело в check1 узагалі). Неповний набір чи невідома стадія — фолбек на
-# дефолт з попередженням у stderr.
+# /etc/nft-scandetect/srv_timeouts — рядки "stage:value", рівно 4 стадії:
+# rate, burst, over, block (дефолт rate:20/minute burst:5 over:20 block:1m).
+# Захист протокол-груп (tcp/80+443 тощо) побудований на nftables `meter`:
+#   - over  -- meter з `ct count over N` -- скільки ОДНОЧАСНО відкритих
+#     з'єднань з одного джерела допустимо;
+#   - rate  -- meter з `limit rate` (token bucket) -- скільки НОВИХ з'єднань
+#     за час допустимо, з дозволеним сплеском burst;
+#   - block -- перевищення БУДЬ-ЯКОГО з двох meter'ів веде в спільний
+#     (per-family) сет srv_block/srv6_block, timeout block, update на
+#     кожній повторній спробі (не спадає передчасно, поки джерело намагається).
+# ВАЖЛИВО: на відміну від srv_block/srv6_block (звичайний `set`, спільний
+# для input і всіх forward-бриджів разом), nftables не дозволяє повторно
+# використати той самий іменований `meter` у двох різних правилах -- тож
+# rate/over-лічильники НЕЗАЛЕЖНІ для кожної (chain × bridge × протокол-група)
+# комбінації (унікальне ім'я = prefix + монотонний лічильник SRV_METER_IDX,
+# скидається на початку build_ruleset). Наслідок: джерело, що б'є одразу по
+# кількох docker-бриджах, має окремий бюджет на кожен -- на відміну від
+# старого сетового каскаду, де бюджет був геть спільний. Для типової
+# інсталяції (один bridge чи взагалі --no-docker) різниці нема.
+# Live-стан: srv_block/srv6_block -- звичайний `set`, підхоплюється capture
+# /restore як завжди; стан самих meter'ів (rate/over) — НІ (`nft -j list`
+# віддає їх під ключем "meter", не "set", capture_live_state його не бачить),
+# тож лічильники скидаються на кожному regen/restart, а список уже
+# заблокованих — ні. Неповний набір чи невідома стадія — фолбек на дефолт
+# з попередженням у stderr. Детальний розбір і живі виміри — TESTS.md.
 #
 # --stop і live-стан: на відміну від звичайного перестворення (де знімок і
 # відновлення відбуваються в одній транзакції), --stop лишає таблицю
@@ -112,15 +130,20 @@ LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))   # 15
 # перевизначається опційним рядком "scan:timeout" у level_timeouts
 DEFAULT_SCAN_TIMEOUT=31d
 
-# srv_* сети: назва -> таймаут. normal -- ковзне вікно (update на кожному
-# новому з'єднанні, див. gen_srv_rules), тому має сенс саме як "як довго
-# тримається довіра з часу ОСТАННЬОГО заходу", а не сумарна тривалість сесії.
-# Різниця check1-normal -- ширина "небезпечної зони" (пауза після сплеску, що
-# ще веде в block); перевірено емпірично на реальних TCP: 30s/90s дають зону
-# 60s, у яку не потрапляє звичайний перегляд (гепи до 30s узагалі не сягають
-# check1), а обережний брутфорс з паузами довшими за normal все одно рано чи
-# пізно впаде в неї.
-SRV_STAGES=(normal:30s check0:10s check1:1m30s block:1m)
+# srv_* -- ліміти захисту протокол-груп (див. gen_srv_rules): rate/burst --
+# nftables `limit rate` (token bucket per-source), over -- `ct count over N`
+# (макс. одночасних з'єднань per-source), block -- таймаут srv_block/srv6_block
+# після перевищення будь-якого з двох. Перевірено емпірично на реальних TCP
+# проти попереднього (сетового) каскаду -- і лагідніший до звичайного
+# перегляду (короткий сплеск під burst не чіпає), і суворіший до стабільного
+# швидкого потоку (якого сетовий каскад узагалі не бачив) -- див. TESTS.md.
+SRV_LIMITS=(rate:20/minute burst:5 over:20 block:1m)
+SRV_RATE="" SRV_BURST="" SRV_OVER="" SRV_BLOCK_TIMEOUT=""
+
+# Монотонний лічильник -- унікальні імена meter (rl_N/over_N) у межах одної
+# генерації; nftables не дозволяє повторно використати те саме ім'я meter у
+# двох різних правилах (на відміну від set). Скидається на початку build_ruleset.
+SRV_METER_IDX=0
 
 # захищені порти для каскаду srv_*/srv6_* (те, що зараз "tcp dport { 80, 443 }")
 SRV_PORTS_DEFAULT=(tcp/80 tcp/443)
@@ -570,20 +593,24 @@ seed_srv_timeouts_if_missing() {
     sudo mkdir -p "$OVERRIDE_DIR"
     {
         echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
-        echo "# Формат: stage:timeout, рівно 4 стадії: normal, check0, check1, block."
-        printf '%s\n' "${SRV_STAGES[@]}"
+        echo "# Формат: stage:value, рівно 4 стадії: rate, burst, over, block."
+        echo "# rate  -- nft 'limit rate', напр. 20/minute (нових з'єднань за час)."
+        echo "# burst -- дозволений сплеск понад rate, у пакетах."
+        echo "# over  -- nft 'ct count over N' (макс. одночасних з'єднань з джерела)."
+        echo "# block -- таймаут блоку після перевищення rate чи over."
+        printf '%s\n' "${SRV_LIMITS[@]}"
     } | sudo tee "$file" >/dev/null
 }
 
-# Перевіряє, що LINES -- це рядки "stage:timeout", де stage -- рівно
-# normal/check0/check1/block, кожна один раз (порядок не важливий).
+# Перевіряє, що LINES -- це рядки "stage:value", де stage -- рівно
+# rate/burst/over/block, кожна один раз (порядок не важливий).
 validate_srv_timeouts() {
     local lines="$1" line
     local -A seen=()
     [[ -z "$lines" ]] && return 1
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        [[ "$line" =~ ^(normal|check0|check1|block):[^:[:space:]]+$ ]] || return 1
+        [[ "$line" =~ ^(rate|burst|over|block):[^:[:space:]]+$ ]] || return 1
         local stage="${line%%:*}"
         [[ -n "${seen[$stage]:-}" ]] && return 1
         seen[$stage]=1
@@ -599,9 +626,9 @@ read_srv_timeouts() {
             printf '%s\n' "$lines"
             return 0
         fi
-        echo "УВАГА: $file невалідний (потрібні рівно 4 стадії: normal/check0/check1/block, кожна один раз) -- використовую вбудований дефолт." >&2
+        echo "УВАГА: $file невалідний (потрібні рівно 4 стадії: rate/burst/over/block, кожна один раз) -- використовую вбудований дефолт." >&2
     fi
-    printf '%s\n' "${SRV_STAGES[@]}"
+    printf '%s\n' "${SRV_LIMITS[@]}"
 }
 
 # Знімає елементи всіх dynamic/timeout сетів живої таблиці (scan/level*/srv_*
@@ -687,40 +714,34 @@ gen_level_sets() {
     done
 }
 
-gen_srv_sets() {
+gen_srv_block_set() {
     local family="$1" prefix="$2"     # ipv4_addr|ipv6_addr ; srv_|srv6_
-    local stage name timeout
-    for stage in "${SRV_STAGES[@]}"; do
-        name="${stage%%:*}"; timeout="${stage##*:}"
-        local label="$name"
-        case "$name" in
-            normal) label="Normal" ;; check0) label="Check0" ;; check1) label="Check1" ;; block) label="Block" ;;
-        esac
-        echo "add set ${TABLE} ${prefix}${name} { type ${family}; size 65535; flags dynamic,timeout; timeout ${timeout}; comment \"Service ${label}\"; }"
-        emit_restore "${prefix}${name}"
-    done
+    echo "add set ${TABLE} ${prefix}block { type ${family}; size 65535; flags dynamic,timeout; timeout ${SRV_BLOCK_TIMEOUT}; comment \"Service Block\"; }"
+    emit_restore "${prefix}block"
 }
 
 gen_srv_rules() {
     # gen_srv_rules CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
-    # L4MATCH -- напр. "tcp dport { 80, 443 }"; кілька L4MATCH можуть ділити
-    # ті самі normal/check0/check1/block (throttle по saddr, не по протоколу)
+    # L4MATCH -- напр. "tcp dport { 80, 443 }".
     #
-    # srv_normal -- КОВЗНЕ вікно: update (не add) на кожному новому з'єднанні,
-    # доки джерело не в block -- освіжається щоразу, а не лише на першому
-    # заході. Небезпечна зона (пауза, після якої свіже з'єднання при ще
-    # живому check1 веде в block) -- це рівно check1 - normal; сам normal тут
-    # ні на що інше не впливає. Перший рядок раніше містив самосуперечливе
-    # "!= @check1 ... @check1" (ніколи не спрацьовувало, srv_block був мертвим
-    # кодом) -- виправлено на "!= @block".
+    # Захист побудований на двох nftables `meter` (per-source token bucket
+    # + per-source concurrent-connection cap) замість сетового каскаду
+    # normal/check0/check1 -- див. TESTS.md за повним порівнянням і причиною.
+    # srv_block/srv6_block лишається звичайним `set`, СПІЛЬНИМ для всіх
+    # викликів gen_srv_rules (input, кожен forward-bridge, кожна протокол-
+    # група) -- той самий "хто вже спійманий" список скрізь. А от rl_N/over_N
+    # -- саме meter, і nftables не дозволяє повторне використання того самого
+    # імені meter у двох різних правилах, тож кожен виклик отримує СВІЙ,
+    # унікальний за SRV_METER_IDX -- rate/over-бюджет per (chain × bridge ×
+    # протокол-група), не спільний, як був у сетовому каскаді.
     local chain="$1" proto="$2" prefix="$3" l4match="$4" ifm="${5:-}"
-    local normal="${prefix}normal" c0="${prefix}check0" c1="${prefix}check1" block="${prefix}block"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} ${proto} saddr != @${normal} ${proto} saddr @${c1} add @${block} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c1} ${proto} saddr @${c0} add @${c1} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${c0} add @${c0} { ${proto} saddr } counter"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} update @${normal} { ${proto} saddr } counter"
+    local block="${prefix}block"
+    local rl="${prefix}rl_${SRV_METER_IDX}" over="${prefix}over_${SRV_METER_IDX}"
+    SRV_METER_IDX=$((SRV_METER_IDX + 1))
     echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
-    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${normal} counter return"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new meter ${over} { ${proto} saddr ct count over ${SRV_OVER} } add @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new meter ${rl} { ${proto} saddr limit rate ${SRV_RATE} burst ${SRV_BURST} packets } counter return"
+    echo "add rule ${TABLE} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} add @${block} { ${proto} saddr } counter drop"
 }
 
 # gen_srv_rules_all_ports CHAIN PROTO PREFIX IFACE_MATCH -- викликає
@@ -836,14 +857,20 @@ build_ruleset() {
     LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))
     scan_timeout=$(read_scan_timeout)
 
-    # ефективні таймаути стадій srv_* -- аналогічно, gen_srv_sets змін не потребує
+    # ефективні ліміти srv_* -- rate/burst/over/block, gen_srv_rules/
+    # gen_srv_block_set читають їх напряму з глобальних SRV_*
     local srv_lines st_line
     srv_lines=$(read_srv_timeouts)
-    SRV_STAGES=()
     while IFS= read -r st_line; do
         [[ -z "$st_line" ]] && continue
-        SRV_STAGES+=("$st_line")
+        case "${st_line%%:*}" in
+            rate)  SRV_RATE="${st_line#*:}" ;;
+            burst) SRV_BURST="${st_line#*:}" ;;
+            over)  SRV_OVER="${st_line#*:}" ;;
+            block) SRV_BLOCK_TIMEOUT="${st_line#*:}" ;;
+        esac
     done <<< "$srv_lines"
+    SRV_METER_IDX=0
 
     # ефективні захищені порти, згруповані по протоколу -- для gen_srv_rules_all_ports
     SRV_PORT_GROUPS=$(read_srv_port_groups)
@@ -880,14 +907,14 @@ build_ruleset() {
         [[ -n "$ignore6" ]] && echo "add element ${TABLE} ignore6 { ${ignore6} }"
         echo "add set ${TABLE} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
         [[ -n "$permanent6" ]] && echo "add element ${TABLE} permanentBlock6 { ${permanent6} }"
-        gen_srv_sets ipv6_addr srv6_
+        gen_srv_block_set ipv6_addr srv6_
         gen_level_sets ipv6_addr level6_
         echo "add set ${TABLE} scan6 { type ipv6_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
         emit_restore "scan6"
     fi
 
     # --- srv_* / level0..level15 (ipv4 -- завжди) ---
-    gen_srv_sets ipv4_addr srv_
+    gen_srv_block_set ipv4_addr srv_
     gen_level_sets ipv4_addr level
     echo "add set ${TABLE} scan { type ipv4_addr; size 65535; flags dynamic,timeout; timeout ${scan_timeout}; comment \"Scan Detect\"; }"
     emit_restore "scan"
