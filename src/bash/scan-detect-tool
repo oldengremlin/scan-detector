@@ -1,31 +1,45 @@
 #!/bin/bash
 
-# scan-detect-tool — керування IP-адресами в таблиці inet scanDetector
+# scan-detect-tool — керування IP-адресами у двох nft-таблицях:
+# inet scanDetector (драбина level*/scan) та inet srvProtector (захист
+# протокол-груп, srv_*).
 #
 # Працює в парі з nft-scan-detector: обидва скрипти вважають файли в
 # /etc/nft-scandetect єдиним джерелом правди для trusted/ignore/permanentBlock.
 # Ця команда:
 #   1. редагує відповідний *-extra.list файл (додає/видаляє рядок);
-#   2. одразу застосовує ту саму зміну до живої таблиці через nft.
+#   2. одразу застосовує ту саму зміну до ЖИВИХ таблиць через nft -- trusted/
+#      ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в обох таблицях
+#      (nftables не дозволяє посилатись на сет з іншої таблиці), тож живе
+#      застосування йде в обидві одразу, щоб вони не розійшлись.
 #
 # Якщо список ще не має override-файлу (перший запуск на цьому списку),
-# файл спершу бутстрапиться поточним станом ЖИВОГО сету -- щоб заводські
-# дефолти з nft-scan-detector (BASE_TRUSTED тощо) не загубились.
+# файл спершу бутстрапиться поточним станом ЖИВОГО сету (з scanDetector) --
+# щоб заводські дефолти з nft-scan-detector (BASE_TRUSTED тощо) не загубились.
 #
 # Використання:
-#   scan-detect-tool --delete IP           видалити IP звідусіль (живі сети +
-#                                           будь-який override-файл, де він є)
-#   scan-detect-tool --add-ignore IP       додати в ignore/ignore6
-#   scan-detect-tool --add-trusted IP      додати в trusted/trusted6
+#   scan-detect-tool --delete IP           видалити IP звідусіль (живі сети в
+#                                           ОБОХ таблицях + будь-який
+#                                           override-файл, де він є)
+#   scan-detect-tool --add-ignore IP       додати в ignore/ignore6 (в обох таблицях)
+#   scan-detect-tool --add-trusted IP      додати в trusted/trusted6 (в обох таблицях)
 #   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
-#   scan-detect-tool --list IP             показати живі сети + override-файли, де є IP
-#   scan-detect-tool --show                вивести повністю table inet scanDetector
+#                                           (в обох таблицях)
+#   scan-detect-tool --list IP             показати живі сети (в обох таблицях) +
+#                                           override-файли, де є IP
+#   scan-detect-tool --show                вивести повністю ОБИДВІ таблиці
+#                                           (inet scanDetector, inet srvProtector)
 #   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
-#                                           (застосовується рестартом scan-detector.service,
-#                                           не "живим" add element)
-#   scan-detect-tool --set-table-name NAME перевизначити назву nft-таблиці (дефолт
-#                                           scanDetector); так само рестартом, і
-#                                           додатково прибирає стару таблицю
+#                                           scanDetector (застосовується рестартом
+#                                           scan-detector.service, не "живим" add
+#                                           element); srvProtector -- завжди N-1,
+#                                           окремо не задається
+#   scan-detect-tool --set-table-name NAME     перевизначити назву scanDetector
+#                                               (дефолт "scanDetector"); так само
+#                                               рестартом, і додатково прибирає
+#                                               стару таблицю
+#   scan-detect-tool --set-table-name-srv NAME те саме для srvProtector (дефолт
+#                                               "srvProtector")
 #   scan-detect-tool --init                досіяти відсутні override-файли дефолтами
 #                                           (делегує nft-scan-detector --init)
 #   scan-detect-tool --dry-run ...         показати команди, нічого не змінюючи
@@ -36,12 +50,14 @@ set -euo pipefail
 
 TABLE_FAMILY="inet"
 DEFAULT_TABLE_NAME="scanDetector"
+DEFAULT_TABLE_NAME_SRV="srvProtector"
 OVERRIDE_DIR="/etc/nft-scandetect"
 DRY_RUN=0
 
-# Читає ${OVERRIDE_DIR}/table_name -- той самий формат і фолбек-логіка, що й
-# у nft-scan-detector (read_table_name там) -- обидва скрипти мають бачити
-# ту саму назву таблиці, інакше редагування/показ підуть не в ту таблицю.
+# Читає ${OVERRIDE_DIR}/table_name(_srv) -- той самий формат і фолбек-логіка,
+# що й у nft-scan-detector (read_table_name(_srv) там) -- обидва скрипти
+# мають бачити ту саму назву таблиці, інакше редагування/показ підуть не
+# в ту таблицю.
 read_table_name() {
     local file="${OVERRIDE_DIR}/table_name" raw
     if [[ -f "$file" ]]; then
@@ -55,33 +71,54 @@ read_table_name() {
     echo "$DEFAULT_TABLE_NAME"
 }
 
+read_table_name_srv() {
+    local file="${OVERRIDE_DIR}/table_name_srv" raw
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file" | tr -d '[:space:]')
+        if [[ "$raw" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "$raw"
+            return 0
+        fi
+        echo "УВАГА: $file містить нелегітимну назву таблиці ('$raw') -- використовую дефолт ${DEFAULT_TABLE_NAME_SRV}." >&2
+    fi
+    echo "$DEFAULT_TABLE_NAME_SRV"
+}
+
 TABLE_NAME="$(read_table_name)"
+TABLE_NAME_SRV="$(read_table_name_srv)"
 
 usage() {
     cat <<EOF
 Використання: $(basename "$0") [--dry-run] КОМАНДА АРГУМЕНТ
 
 Команди:
-  --delete IP           Видалити IP з усіх живих сетів і з усіх override-файлів,
-                         де він знайдений
-  --add-ignore IP        Додати IP в ignore (ignore6 для IPv6)
-  --add-trusted IP       Додати IP в trusted (trusted6 для IPv6)
+  --delete IP           Видалити IP з усіх живих сетів ОБОХ таблиць і з усіх
+                         override-файлів, де він знайдений
+  --add-ignore IP        Додати IP в ignore (ignore6 для IPv6) -- в ОБОХ таблицях
+  --add-trusted IP       Додати IP в trusted (trusted6 для IPv6) -- в ОБОХ таблицях
   --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
-  --list IP              Показати живі сети та override-файли, де присутній IP
-  --show                 Вивести повністю живу таблицю (nft list table inet
-                         scanDetector) -- усі сети й правила як є зараз
-  --set-priority N       Перевизначити пріоритет hook'ів input/forward (ціле
-                         число, дефолт -50). На відміну від інших команд
-                         застосовується не одразу в живих сетах, а рестартом
-                         scan-detector.service (потрібна повна перегенерація).
-  --set-table-name NAME  Перевизначити назву nft-таблиці (дефолт scanDetector).
-                         Так само повна перегенерація рестартом
-                         scan-detector.service, і додатково прибирає стару
-                         таблицю під попередньою назвою (nft не вміє
-                         перейменувати таблицю "на місці").
+                         -- в ОБОХ таблицях
+  --list IP              Показати живі сети (в ОБОХ таблицях) та override-файли,
+                         де присутній IP
+  --show                 Вивести повністю ОБИДВІ живі таблиці (nft list table
+                         inet scanDetector; inet srvProtector) -- усі сети й
+                         правила як є зараз
+  --set-priority N       Перевизначити пріоритет hook'ів input/forward
+                         scanDetector (ціле число, дефолт -50). На відміну
+                         від інших команд застосовується не одразу в живих
+                         сетах, а рестартом scan-detector.service (потрібна
+                         повна перегенерація). Пріоритет srvProtector окремо
+                         не задається -- завжди N-1 (рахується автоматично).
+  --set-table-name NAME  Перевизначити назву таблиці scanDetector (дефолт
+                         "scanDetector"). Так само повна перегенерація
+                         рестартом scan-detector.service, і додатково
+                         прибирає стару таблицю під попередньою назвою (nft
+                         не вміє перейменувати таблицю "на місці").
+  --set-table-name-srv NAME  Те саме, для таблиці srvProtector (дефолт
+                         "srvProtector").
   --init                 Досіяти відсутні override-файли вбудованими
                          дефолтами (делегує nft-scan-detector --init).
-                         Живої таблиці не чіпає, аргументу не потребує.
+                         Живих таблиць не чіпає, аргументу не потребує.
 
 Опції:
   --dry-run              Показати команди/дії, нічого не застосовуючи
@@ -148,6 +185,10 @@ all_extra_files() {
 
 # Витягує елементи ЖИВОГО (статичного, interval) сету у вигляді "по одному
 # значенню на рядок" -- враховує і прості значення, і CIDR-об'єкти {"prefix":...}.
+# Читає з ${TABLE_NAME} (scanDetector) -- цього досить для бутстрапу:
+# trusted/ignore/permanentBlock ідентичні в обох таблицях (та сама
+# генерація з тих самих override-файлів), тож не важливо, з якої саме
+# зняти початковий стан.
 live_set_elements() {
     local set_name="$1"
     sudo nft -j list set "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" 2>/dev/null | jq -r '
@@ -216,22 +257,27 @@ remove_if_present() {
     echo "  - видалено з $file"
 }
 
-# --- пошук IP у живих сетах (level*, scan*, trusted/ignore/permanent...) ---
+# --- пошук IP у живих сетах ОБОХ таблиць (level*/scan* у scanDetector,
+# srv_block/srv6_block і дубльовані trusted/ignore/permanent* у
+# srvProtector) -- друкує "TABLE_NAME<TAB>SET_NAME" по рядку, щоб виклик
+# (cmd_list/cmd_delete) знав, у якій саме таблиці шукати/видаляти елемент.
 find_live_sets_with_ip() {
-    local ip="$1"
-    sudo nft -j list table "${TABLE_FAMILY}" "${TABLE_NAME}" | jq -r --arg ip "$ip" '
-        .nftables[]
-        | select(.set?)
-        | .set
-        | select(
-            .elem? and any(.elem[]?;
-                (if type=="object" then
-                    (.elem.val // (if has("prefix") then "\(.prefix.addr)/\(.prefix.len)" else empty end))
-                 else .
-                 end) == $ip)
-          )
-        | .name
-    '
+    local ip="$1" tname
+    for tname in "$TABLE_NAME" "$TABLE_NAME_SRV"; do
+        sudo nft -j list table "${TABLE_FAMILY}" "$tname" 2>/dev/null | jq -r --arg ip "$ip" --arg t "$tname" '
+            .nftables[]
+            | select(.set?)
+            | .set
+            | select(
+                .elem? and any(.elem[]?;
+                    (if type=="object" then
+                        (.elem.val // (if has("prefix") then "\(.prefix.addr)/\(.prefix.len)" else empty end))
+                     else .
+                     end) == $ip)
+              )
+            | "\($t)\t\(.name)"
+        '
+    done
 }
 
 cmd_list() {
@@ -241,10 +287,10 @@ cmd_list() {
     local sets
     sets=$(find_live_sets_with_ip "$ip")
     if [[ -z "$sets" ]]; then
-        echo "IP $ip не знайдено в жодному живому сеті таблиці ${TABLE_NAME}."
+        echo "IP $ip не знайдено в жодному живому сеті таблиць ${TABLE_NAME}/${TABLE_NAME_SRV}."
     else
         echo "IP $ip знайдено в живих сетах:"
-        echo "$sets" | sed 's/^/  - /'
+        echo "$sets" | awk -F'\t' '{print "  - " $1 ": " $2}'
     fi
 
     echo "Присутність в override-файлах:"
@@ -259,10 +305,11 @@ cmd_list() {
     return 0
 }
 
-# cmd_show -- виводить nft list table inet scanDetector як є (без --dry-run
+# cmd_show -- виводить nft list table для ОБОХ таблиць як є (без --dry-run
 # особливостей: команда й так нічого не змінює, лише читає)
 cmd_show() {
     sudo nft list table "${TABLE_FAMILY}" "${TABLE_NAME}"
+    sudo nft list table "${TABLE_FAMILY}" "${TABLE_NAME_SRV}"
 }
 
 cmd_delete() {
@@ -275,10 +322,10 @@ cmd_delete() {
         echo "IP $ip не знайдено в жодному живому сеті."
     else
         echo "Видаляю $ip з живих сетів:"
-        while IFS= read -r set_name; do
+        while IFS=$'\t' read -r tname set_name; do
             [[ -z "$set_name" ]] && continue
-            echo "  - $set_name"
-            run_nft delete element "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" "{ $ip }"
+            echo "  - $tname: $set_name"
+            run_nft delete element "${TABLE_FAMILY}" "$tname" "$set_name" "{ $ip }"
         done <<< "$sets"
     fi
 
@@ -295,6 +342,10 @@ cmd_delete() {
 }
 
 # cmd_add KIND IP  -- KIND: trusted | ignore | permanent
+# trusted/ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в обох таблицях
+# (nftables не дозволяє посилатись на сет з іншої таблиці) -- живе
+# застосування йде в ОБИДВІ, інакше вони розійдуться (IP довірений у
+# scanDetector, але й далі rate/over-лімітується в srvProtector).
 cmd_add() {
     local kind="$1" ip="$2"
     validate_ip "$ip"
@@ -308,8 +359,11 @@ cmd_add() {
     echo "Додаю $ip у $kind ($set_name):"
     append_if_missing "$file" "$ip"
 
-    run_nft add element "${TABLE_FAMILY}" "${TABLE_NAME}" "$set_name" "{ $ip }" \
-        || echo "УВАГА: не вдалось застосувати наживо (таблиця/сет ще не створені? запустіть nft-scan-detector)." >&2
+    local tname
+    for tname in "$TABLE_NAME" "$TABLE_NAME_SRV"; do
+        run_nft add element "${TABLE_FAMILY}" "$tname" "$set_name" "{ $ip }" \
+            || echo "УВАГА: не вдалось застосувати наживо в inet $tname / $set_name (таблиця/сет ще не створені? запустіть nft-scan-detector)." >&2
+    done
 }
 
 # cmd_set_priority VALUE -- перевизначає пріоритет hook'ів input/forward
@@ -337,6 +391,7 @@ cmd_set_priority() {
     echo "Пріоритет збережено: $value ($file)."
 
     echo "Пріоритет міняє сам hook -- застосовується лише повною перегенерацією." >&2
+    echo "Пріоритет srvProtector зміниться разом (завжди $((value - 1)), N-1 від scanDetector)." >&2
     echo "Рестартую scan-detector.service..." >&2
     if sudo systemctl restart scan-detector.service 2>/dev/null; then
         echo "Застосовано."
@@ -345,38 +400,32 @@ cmd_set_priority() {
     fi
 }
 
-# cmd_set_table_name NAME -- перевизначає назву nft-таблиці
-# (${OVERRIDE_DIR}/table_name). На відміну від решти команд тут МАЛО просто
-# перезаписати файл і рестартнути scan-detector.service: nft не вміє
-# перейменувати таблицю "на місці" -- звичайний перезапуск створив би НОВУ
-# таблицю під новою назвою поруч зі СТАРОЮ (та лишилась би назавжди активна,
-# й далі фільтрувала б трафік під забутою назвою). Тож тут явно приберається
-# стара таблиця (якщо вона є) перед рестартом.
-cmd_set_table_name() {
-    local raw="$1" value old_name file
-    value="${raw//[[:space:]]/}"
-    if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-        echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
-        exit 1
-    fi
-    old_name="$TABLE_NAME"
-    file="${OVERRIDE_DIR}/table_name"
+# _set_table_name_generic FILE OLD_NAME NEW_VALUE LABEL -- спільна логіка
+# для cmd_set_table_name і cmd_set_table_name_srv (та сама процедура для
+# обох таблиць): записати override-файл, прибрати СТАРУ таблицю (nft не
+# вміє перейменувати "на місці" -- звичайний перезапуск створив би НОВУ
+# таблицю під новою назвою поруч зі СТАРОЮ, та лишилась би назавжди активна
+# й далі фільтрувала б трафік під забутою назвою), рестартнути
+# scan-detector.service. LABEL -- людський опис для повідомлень
+# ("scanDetector"/"srvProtector").
+_set_table_name_generic() {
+    local file="$1" old_name="$2" value="$3" label="$4"
 
     if [[ "$value" == "$old_name" ]]; then
-        echo "Назва таблиці вже '$value' -- нічого не змінюю."
+        echo "Назва таблиці $label вже '$value' -- нічого не змінюю."
         return 0
     fi
 
     if [[ $DRY_RUN -eq 1 ]]; then
         echo "(dry-run) echo '$value' > $file"
-        echo "(dry-run) nft delete table ${TABLE_FAMILY} ${old_name}   # стара таблиця, якщо існує"
+        echo "(dry-run) nft delete table ${TABLE_FAMILY} ${old_name}   # стара таблиця $label, якщо існує"
         echo "(dry-run) systemctl restart scan-detector.service"
         return 0
     fi
 
     sudo mkdir -p "$OVERRIDE_DIR"
     echo "$value" | sudo tee "$file" >/dev/null
-    echo "Нову назву таблиці збережено: $value ($file)."
+    echo "Нову назву таблиці $label збережено: $value ($file)."
 
     echo "Назва таблиці міняє саму nft-таблицю -- це не \"живий\" add element," >&2
     echo "а повна перегенерація. Прибираю стару таблицю ${TABLE_FAMILY} ${old_name}, якщо є..." >&2
@@ -396,6 +445,38 @@ cmd_set_table_name() {
     else
         echo "УВАГА: не вдалось перезапустити scan-detector.service -- застосуйте вручну: sudo nft-scan-detector" >&2
     fi
+}
+
+# cmd_set_table_name NAME -- перевизначає назву таблиці scanDetector
+# (${OVERRIDE_DIR}/table_name).
+cmd_set_table_name() {
+    local raw="$1" value
+    value="${raw//[[:space:]]/}"
+    if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
+        exit 1
+    fi
+    if [[ "$value" == "$TABLE_NAME_SRV" ]]; then
+        echo "Помилка: '$value' уже назва другої таблиці (srvProtector) -- дві таблиці не можуть мати однакову назву." >&2
+        exit 1
+    fi
+    _set_table_name_generic "${OVERRIDE_DIR}/table_name" "$TABLE_NAME" "$value" "scanDetector"
+}
+
+# cmd_set_table_name_srv NAME -- те саме, для таблиці srvProtector
+# (${OVERRIDE_DIR}/table_name_srv).
+cmd_set_table_name_srv() {
+    local raw="$1" value
+    value="${raw//[[:space:]]/}"
+    if [[ ! "$value" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
+        exit 1
+    fi
+    if [[ "$value" == "$TABLE_NAME" ]]; then
+        echo "Помилка: '$value' уже назва першої таблиці (scanDetector) -- дві таблиці не можуть мати однакову назву." >&2
+        exit 1
+    fi
+    _set_table_name_generic "${OVERRIDE_DIR}/table_name_srv" "$TABLE_NAME_SRV" "$value" "srvProtector"
 }
 
 # cmd_init -- тонка обгортка над nft-scan-detector --init: сіє відсутні
@@ -434,6 +515,8 @@ while [[ $# -gt 0 ]]; do
             ACTION="set-priority"; ARG="${2:-}"; shift 2 ;;
         --set-table-name)
             ACTION="set-table-name"; ARG="${2:-}"; shift 2 ;;
+        --set-table-name-srv)
+            ACTION="set-table-name-srv"; ARG="${2:-}"; shift 2 ;;
         --init)
             ACTION="init"; shift ;;
         --dry-run)
@@ -465,5 +548,6 @@ case "$ACTION" in
     show)          cmd_show ;;
     set-priority)  cmd_set_priority "$ARG" ;;
     set-table-name) cmd_set_table_name "$ARG" ;;
+    set-table-name-srv) cmd_set_table_name_srv "$ARG" ;;
     init)          cmd_init ;;
 esac

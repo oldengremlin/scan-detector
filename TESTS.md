@@ -301,6 +301,11 @@ block:1m
 
 ### Фінальні правила (`{ 80, 443 }`, реально застосовані й перевірені)
 
+Станом на момент експерименту нижче все це ще жило в тій самій таблиці, що
+й `level*`/`scan` (розділення на окрему `table inet srvProtector` сталось
+пізніше — див. новий розділ "Розділення на дві table inet" нижче, разом із
+доданим тоді ж рядком-лічильником `permanentBlock`, якого тут ще нема):
+
 ```
 tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter drop
 tcp dport { 80, 443 } ct state new meter srv_over_0 { ip saddr ct count over 20 } add @srv_block { ip saddr } counter drop
@@ -402,3 +407,85 @@ block:1m
   колись знадобиться свідомо поставити НЕ 5, а щось інше, варто
   перевірити виведення на конкретній версії окремо, а не покладатись на
   те, що "не показано — отже дефолт".
+
+## Розділення на дві table inet
+
+Захист протокол-груп (`srv_*`, усе з розділу "Заміна на `meter`-модель"
+вище) винесено з `scanDetector` в окрему `table inet srvProtector` — див.
+README → "Як це працює"/"Назва nft-таблиць". Перевірено наживо в
+пісочниці (`nftables v1.0.9`, `nft -c -f` → `nft -f`, реальне
+застосування, не лише синтаксична перевірка):
+
+```
+table inet scanDetector {
+	...
+	chain input {
+		type filter hook input priority -50; policy accept;
+		ip saddr @permanentBlock counter packets 0 bytes 0 drop
+		ct state new ip saddr @trusted counter packets 0 bytes 0 return
+		ct state new ip saddr @ignore counter packets 0 bytes 0 return
+		ct state new ip saddr != @scan ip saddr @level0 add @scan { ip saddr } counter packets 0 bytes 0
+		...
+	}
+}
+table inet srvProtector {
+	set trusted { type ipv4_addr; flags interval; auto-merge; elements = { 127.0.0.0/8 } }
+	set ignore { type ipv4_addr; flags interval; auto-merge; elements = { 0.0.0.0 } }
+	set permanentBlock { type ipv4_addr; flags interval; auto-merge; }
+	set srv_block { type ipv4_addr; size 65535; flags dynamic,timeout; timeout 1m; }
+
+	chain input {
+		type filter hook input priority -51; policy accept;
+		ip saddr @permanentBlock counter packets 0 bytes 0 drop
+		ct state new ip saddr @trusted counter packets 0 bytes 0 return
+		ct state new ip saddr @ignore counter packets 0 bytes 0 return
+		tcp dport { 80, 443 } ct state new ip saddr @permanentBlock counter packets 0 bytes 0 drop
+		tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter packets 0 bytes 0 drop
+		tcp dport { 80, 443 } ct state new meter srv_over_0 size 65535 { ip saddr ct count over 20 } add @srv_block { ip saddr } counter packets 0 bytes 0 drop
+		tcp dport { 80, 443 } ct state new meter srv_rl_0 size 65535 { ip saddr limit rate 20/minute burst 5 packets } counter packets 0 bytes 0 return
+		tcp dport { 80, 443 } ct state new ip saddr != @srv_block add @srv_block { ip saddr } counter packets 0 bytes 0 drop
+	}
+	chain forward {
+		type filter hook forward priority -51; policy accept;
+		iifname != "testbr0" oifname "testbr0" ip saddr @permanentBlock counter packets 0 bytes 0 drop
+		iifname != "testbr0" oifname "testbr0" ct state new ip saddr @trusted counter packets 0 bytes 0 return
+		iifname != "testbr0" oifname "testbr0" ct state new ip saddr @ignore counter packets 0 bytes 0 return
+		iifname != "testbr0" oifname "testbr0" tcp dport { 80, 443 } ct state new ip saddr @permanentBlock counter packets 0 bytes 0 drop
+		iifname != "testbr0" oifname "testbr0" tcp dport { 80, 443 } ct state new ip saddr @srv_block update @srv_block { ip saddr } counter packets 0 bytes 0 drop
+		iifname != "testbr0" oifname "testbr0" tcp dport { 80, 443 } ct state new meter srv_over_1 size 65535 { ip saddr ct count over 20 } add @srv_block { ip saddr } counter packets 0 bytes 0 drop
+		iifname != "testbr0" oifname "testbr0" tcp dport { 80, 443 } ct state new meter srv_rl_1 size 65535 { ip saddr limit rate 20/minute burst 5 packets } counter packets 0 bytes 0 return
+		iifname != "testbr0" oifname "testbr0" tcp dport { 80, 443 } ct state new ip saddr != @srv_block add @srv_block { ip saddr } counter packets 0 bytes 0 drop
+	}
+}
+```
+
+Підтверджено все заплановане одразу:
+- `srvProtector` реально на `priority -51` — на одиницю нижче за
+  `scanDetector` (`-50`), рахується автоматично з `priority`, без
+  окремого override-файлу.
+- `trusted`/`ignore`/`permanentBlock` — дубльовані в `srvProtector`, з
+  тим самим вмістом (`127.0.0.0/8`, `0.0.0.0`), що й у `scanDetector`.
+- Новий скопований на `tcp dport { 80, 443 }` рядок `permanentBlock` —
+  на місці, ПЕРЕД перевіркою `srv_block`/`meter`, з власним лічильником.
+  `forward`-версія (per-bridge) — так само.
+  Порядок для forward і тут "чейн-широкий guard → dport-scoped guard →
+  srv_block → meter-перевірки", той самий, що й для `input`.
+- `SRV_METER_IDX` наскрізний по всій таблиці (`srv_over_0`/`srv_rl_0`
+  для `input`, `srv_over_1`/`srv_rl_1` для `forward`-бриджа) — той самий
+  механізм, що й до розділення, просто тепер у межах `srvProtector`
+  окремо від `scanDetector`.
+
+Перевірено також (окремо, без наведення повного виводу): колізія
+`table_name`/`table_name_srv` (обидва файли з однаковим вмістом) коректно
+зупиняє `nft-scan-detector` з помилкою ще до спроби застосувати щось
+наживо; `nft-scan-detector --stop-fwd` знімає `forward` в ОБОХ таблицях
+за одну транзакцію, `input` і сети лишаються; `nft-scan-detector --stop`
+знімає знімок з ОБОХ таблиць в один `live-state-pending.tsv`, видаляє
+обидві, і наступний звичайний запуск коректно відновлює live-стан
+(перевірено на `level15`: значення й решта таймауту збіглись).
+
+`scan-detect-tool` теж перевірено наживо: `--show` виводить обидві
+таблиці одна за одною; `--add-trusted` застосовує `add element` в ОБИДВІ
+одразу (перевірено читанням `nft list set` з кожної окремо після виклику);
+`--list`/`--delete` знаходять і прибирають елемент з обох, з префіксом
+назви таблиці в виводі (`scanDetector: trusted`, `srvProtector: trusted`).
