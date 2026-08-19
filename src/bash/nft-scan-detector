@@ -77,6 +77,24 @@
 # (порядок правил). Довільних окремих пріоритетів для другої таблиці не
 # передбачено -- саме "-1" без варіантів.
 #
+# /etc/nft-scandetect/<назва> (підкаталог) — ДОДАТКОВІ srv-протектор-подібні
+# таблиці, окремо навіть від ${DEFAULT_TABLE_NAME_SRV}: наприклад, окрема,
+# суворіша (менший rate, коротший over) таблиця лише для tcp/22, окремо від
+# типової tcp/80+443. Кожен підкаталог -- окрема table inet, назва = ім'я
+# каталогу (легітимний nft-ідентифікатор, інакше пропускається з
+# попередженням; так само якщо збігається з ${DEFAULT_TABLE_NAME}/
+# ${DEFAULT_TABLE_NAME_SRV}). Усередині -- РІВНО два файли того самого
+# формату, що й у корені: srv_ports і srv_timeouts, і опційно priority
+# (валідується: обов'язково МЕНШЕ за основний priority, інакше фолбек на
+# priority-1 з попередженням). Trusted/ignore/permanentBlock/ipv6/
+# level_timeouts/extra_forward_ifaces СВОГО файлу в підкаталозі НЕ мають --
+# успадковуються з головного конфігу (${OVERRIDE_DIR}) без дублювання:
+# дублювати їх сенсу нема (та сама довіра/ігнор скрізь), а от srv_ports/
+# srv_timeouts/priority — саме те, заради чого ця додаткова таблиця й
+# існує. Каталоги створюються вручну (`mkdir`), nft-scan-detector сам їх не
+# створює -- лише досіює srv_ports/srv_timeouts, якщо їх ще нема всередині
+# вже наявного каталогу. Див. discover_extra_srv_dirs/build_srv_table.
+#
 # /etc/nft-scandetect/ipv6 — той самий формат: РІВНО одне слово, 0/off,
 # 1/on чи auto (дефолт auto). --no-ipv6 (прапорець) переважає цей файл для
 # конкретного запуску. "auto" — sysctl (net.ipv6.conf.all.disable_ipv6) І
@@ -316,10 +334,11 @@ usage() {
                         (стара поведінка: суцільний delete table без
                         відновлення). За замовчуванням live-стан
                         (scan/level0..level15 у ${TABLE#* }, srv_* у
-                        ${TABLE_SRV#* }, і IPv6-відповідники) переживає
-                        перестворення обох таблиць.
+                        ${TABLE_SRV#* } і в кожній додатковій srv-таблиці, і
+                        IPv6-відповідники) переживає перестворення усіх
+                        таблиць.
   --no-docker           Не підхоплювати docker-бриджі автоматично. Ланцюг
-                        forward усе одно будується (в обох таблицях), якщо
+                        forward усе одно будується (в усіх таблицях), якщо
                         є хоч один інтерфейс з
                         ${OVERRIDE_DIR}/extra_forward_ifaces -- інакше
                         лишається тільки input. Активується й автоматично,
@@ -346,39 +365,53 @@ ${OVERRIDE_DIR}/ipv6 -- постійне налаштування (рівно о
           (включно з lo) є реальна маршрутизована (не link-local) адреса
 
 --stop-fwd / --stop-fwd-docker -- окремий режим, нічого не перегенеровує, а
-лише знімає ланцюг forward із ОБОХ живих таблиць (input, сети й live-стан
-не чіпає жодної). Корисно перед зупинкою Docker -- forward з великою
+лише знімає ланцюг forward з УСІХ живих таблиць (input, сети й live-стан
+не чіпає в жодній). Корисно перед зупинкою Docker -- forward з великою
 кількістю per-bridge правил заважає docker чисто "гаситись". Щоб повернути
 forward -- достатньо звичайного запуску без окремих режимів.
 
-  --stop-fwd            Зняти ланцюг forward в обох таблицях, більше нічого
+  --stop-fwd            Зняти ланцюг forward в усіх таблицях, більше нічого
                         не робити.
   --stop-fwd-docker      Те саме, що --stop-fwd, і додатково зупинити
                         docker.socket та docker.service (у цьому порядку).
 
---stop -- прибирає ОБИДВІ таблиці (${TABLE} і ${TABLE_SRV}) із системи
-ПОВНІСТЮ (delete table: і input, і forward, і всі сети, в кожній). Хост і
-docker-мережі після цього нічим не захищені. Live-стан каскаду
-(scan/level* з ${TABLE#* }, srv_* з ${TABLE_SRV#* }) перед видаленням
-зберігається в ${AUDIT_DIR}/live-state-pending.tsv і автоматично
-відновлюється при першому наступному звичайному запуску (systemctl
-start/restart чи просто nft-scan-detector без прапорців) -- незалежно від
-того, за скільки часу це станеться. Це і є ExecStop у
-scan-detector.service: "systemctl stop scan-detector.service" реально
-гасить обидві таблиці, а не просто позначає юніт неактивним.
+--stop -- прибирає УСІ відомі таблиці (${TABLE}, ${TABLE_SRV}, і кожну
+додаткову srv-таблицю) із системи ПОВНІСТЮ (delete table: і input, і
+forward, і всі сети, в кожній). Хост і docker-мережі після цього нічим не
+захищені. Live-стан кожної таблиці перед видаленням зберігається в
+${AUDIT_DIR}/live-state-pending.tsv і автоматично відновлюється при
+першому наступному звичайному запуску (systemctl start/restart чи просто
+nft-scan-detector без прапорців) -- незалежно від того, за скільки часу це
+станеться. Це і є ExecStop у scan-detector.service: "systemctl stop
+scan-detector.service" реально гасить усі таблиці, а не просто позначає
+юніт неактивним.
 
-  --stop                Повністю видалити обидві таблиці, більше нічого не
-                        робити.
+  --stop                Повністю видалити усі відомі таблиці, більше нічого
+                        не робити.
 
 ${OVERRIDE_DIR}/table_name / table_name_srv -- постійне налаштування
 (рівно одна назва, легітимний nft-ідентифікатор на файл), дефолти
 "scanDetector" і "srvProtector" відповідно. Родина (inet) не
-конфігурується, і в обох таблиць спільна. Керується вручну або через
+конфігурується, і спільна для всіх таблиць. Керується вручну або через
 scan-detect-tool --set-table-name NAME / --set-table-name-srv NAME (той
 сеттер додатково прибирає СТАРУ таблицю під попередньою назвою -- nft не
 вміє перейменувати "на місці"). Пріоритет ${TABLE_SRV#* } окремим файлом
 не конфігурується -- завжди priority-1 (нижче число -- спрацьовує раніше),
 див. ${OVERRIDE_DIR}/priority.
+
+${OVERRIDE_DIR}/<назва> (підкаталог) -- ДОДАТКОВІ srv-протектор-подібні
+таблиці, поза межами ${TABLE_SRV}: кожен підкаталог у ${OVERRIDE_DIR} --
+окрема table inet "<назва>" (назва каталогу = легітимний nft-ідентифікатор,
+інакше пропускається з попередженням; так само пропускається, якщо
+збігається з ${TABLE#* }/${TABLE_SRV#* }). Усередині -- лише два файли,
+srv_ports і srv_timeouts (той самий формат, що й у корені ${OVERRIDE_DIR}),
+і опційний priority (те саме ціле число, обов'язково МЕНШЕ за основний
+${OVERRIDE_DIR}/priority -- інакше фолбек на priority-1 з попередженням).
+Решта -- trusted/ignore/permanentBlock/ipv6/level_timeouts/
+extra_forward_ifaces -- УСПАДКОВУЄТЬСЯ з головного конфігу, власних
+override-файлів для цього в підкаталозі нема. Каталоги створюються вручну
+(`mkdir ${OVERRIDE_DIR}/<назва>`) -- nft-scan-detector сам їх не створює,
+лише досіює відсутні srv_ports/srv_timeouts всередині вже наявних.
 
 --init -- ще один окремий режим: лише сіє всі override-файли в
 ${OVERRIDE_DIR} вбудованими дефолтами, якщо їх ще нема (ті самі
@@ -609,10 +642,15 @@ read_scan_timeout() {
     echo "$DEFAULT_SCAN_TIMEOUT"
 }
 
+# seed_srv_ports_if_missing [SUBDIR] -- SUBDIR порожній для головної
+# srv-таблиці (${OVERRIDE_DIR}/srv_ports), інакше -- для додаткової,
+# каталог-зареєстрованої (${OVERRIDE_DIR}/SUBDIR/srv_ports), див.
+# discover_extra_srv_dirs нижче.
 seed_srv_ports_if_missing() {
-    local file="${OVERRIDE_DIR}/srv_ports"
+    local subdir="${1:-}"
+    local file="${OVERRIDE_DIR}/${subdir:+${subdir}/}srv_ports"
     [[ -f "$file" ]] && return 0
-    sudo mkdir -p "$OVERRIDE_DIR"
+    sudo mkdir -p "$(dirname "$file")"
     {
         echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
         echo "# Формат: proto/port, по одному рядку (proto: tcp або udp)."
@@ -620,12 +658,14 @@ seed_srv_ports_if_missing() {
     } | sudo tee "$file" >/dev/null
 }
 
-# Читає ${OVERRIDE_DIR}/srv_ports, групує по протоколу, друкує
-# "proto:port1,port2,..." по рядку (один рядок на протокол). Невалідні окремі
-# рядки пропускаються з попередженням; якщо після фільтрації не лишилось
-# жодного валідного порту -- вбудований дефолт (SRV_PORTS_DEFAULT).
+# read_srv_port_groups [SUBDIR] -- читає ${OVERRIDE_DIR}/[SUBDIR/]srv_ports,
+# групує по протоколу, друкує "proto:port1,port2,..." по рядку (один рядок
+# на протокол). Невалідні окремі рядки пропускаються з попередженням; якщо
+# після фільтрації не лишилось жодного валідного порту -- вбудований дефолт
+# (SRV_PORTS_DEFAULT).
 read_srv_port_groups() {
-    local file="${OVERRIDE_DIR}/srv_ports" raw="" line proto port
+    local subdir="${1:-}"
+    local file="${OVERRIDE_DIR}/${subdir:+${subdir}/}srv_ports" raw="" line proto port
     local -A by_proto=()
 
     [[ -f "$file" ]] && raw=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
@@ -640,11 +680,11 @@ read_srv_port_groups() {
                 continue
             fi
         fi
-        echo "УВАГА: '$line' у ${OVERRIDE_DIR}/srv_ports не схоже на proto/port (tcp|udp/1..65535) -- пропускаю." >&2
+        echo "УВАГА: '$line' у $file не схоже на proto/port (tcp|udp/1..65535) -- пропускаю." >&2
     done <<< "$raw"
 
     if [[ ${#by_proto[@]} -eq 0 ]]; then
-        echo "УВАГА: жодного валідного proto/port у ${OVERRIDE_DIR}/srv_ports -- використовую вбудований дефолт." >&2
+        echo "УВАГА: жодного валідного proto/port у $file -- використовую вбудований дефолт." >&2
         local d
         for d in "${SRV_PORTS_DEFAULT[@]}"; do
             proto="${d%%/*}"; port="${d##*/}"
@@ -658,10 +698,12 @@ read_srv_port_groups() {
     done
 }
 
+# seed_srv_timeouts_if_missing [SUBDIR] -- та сама логіка, для srv_timeouts.
 seed_srv_timeouts_if_missing() {
-    local file="${OVERRIDE_DIR}/srv_timeouts"
+    local subdir="${1:-}"
+    local file="${OVERRIDE_DIR}/${subdir:+${subdir}/}srv_timeouts"
     [[ -f "$file" ]] && return 0
-    sudo mkdir -p "$OVERRIDE_DIR"
+    sudo mkdir -p "$(dirname "$file")"
     {
         echo "# Автоматично створено nft-scan-detector $(date '+%Y-%m-%d %H:%M:%S') із вбудованих дефолтів."
         echo "# Формат: stage:value, рівно 4 стадії: rate, burst, over, block."
@@ -689,8 +731,10 @@ validate_srv_timeouts() {
     [[ ${#seen[@]} -eq 4 ]]
 }
 
+# read_srv_timeouts [SUBDIR] -- та сама логіка, для srv_timeouts.
 read_srv_timeouts() {
-    local file="${OVERRIDE_DIR}/srv_timeouts" lines
+    local subdir="${1:-}"
+    local file="${OVERRIDE_DIR}/${subdir:+${subdir}/}srv_timeouts" lines
     if [[ -f "$file" ]]; then
         lines=$( (grep -vE '^\s*(#|$)' "$file" || true) | sed 's/[[:space:]]//g' )
         if validate_srv_timeouts "$lines"; then
@@ -702,14 +746,95 @@ read_srv_timeouts() {
     printf '%s\n' "${SRV_LIMITS[@]}"
 }
 
+# read_extra_priority SUBDIR MAIN_PRIORITY -- пріоритет для ДОДАТКОВОЇ
+# srv-таблиці з ${OVERRIDE_DIR}/SUBDIR/priority (рівно одне ціле число, той
+# самий формат, що й головний priority). Гарантія "менше за основний"
+# ВАЛІДУЄТЬСЯ тут: відсутній файл, нелегітимне значення, чи значення >=
+# MAIN_PRIORITY -- фолбек на MAIN_PRIORITY-1 (той самий дефолт, що й у
+# ${DEFAULT_TABLE_NAME_SRV}) з попередженням у другому й третьому випадку.
+read_extra_priority() {
+    local subdir="$1" main_priority="$2"
+    local file="${OVERRIDE_DIR}/${subdir}/priority" raw fallback=$((main_priority - 1))
+    if [[ -f "$file" ]]; then
+        raw=$(head -1 "$file"); raw="${raw//[[:space:]]/}"
+        if [[ "$raw" =~ ^-?[0-9]+$ ]]; then
+            if (( raw < main_priority )); then
+                echo "$raw"
+                return 0
+            fi
+            echo "УВАГА: ${file} містить пріоритет ${raw}, не менший за основний (${main_priority}) -- використовую ${fallback}." >&2
+        else
+            echo "УВАГА: ${file} містить нелегітимне значення пріоритету ('$raw') -- використовую ${fallback}." >&2
+        fi
+    fi
+    echo "$fallback"
+}
+
+# discover_extra_srv_dirs -- сканує ${OVERRIDE_DIR} на предмет підкаталогів
+# (кожен -- ДОДАТКОВА srv-протектор-подібна таблиця, окрема від головної
+# ${TABLE_SRV}: своя table inet <назва_каталогу>, свій priority/srv_ports/
+# srv_timeouts; trusted/ignore/permanentBlock/ipv6/level_timeouts/
+# extra_forward_ifaces УСПАДКОВУЮТЬСЯ з головного конфігу, свого файлу не
+# мають). Друкує валідні назви (=basename каталогу) по рядку, відсортовано.
+# Каталог пропускається (з попередженням) якщо назва не легітимний
+# nft-ідентифікатор або збігається з ${TABLE_NAME}/${TABLE_NAME_SRV}.
+# Результат КЕШУЄТЬСЯ (EXTRA_SRV_DIRS_CACHE) -- викликається по кілька разів
+# за один прогін (seed_all_config_if_missing, build_ruleset, list_all_tables
+# ×2 у main()), без кешу те саме попередження про кожен пропущений каталог
+# друкувалось би в stderr стільки ж разів поспіль.
+EXTRA_SRV_DIRS_CACHED=0
+EXTRA_SRV_DIRS_CACHE=""
+discover_extra_srv_dirs() {
+    if [[ $EXTRA_SRV_DIRS_CACHED -eq 0 ]]; then
+        local d name main_name srv_name result=""
+        main_name="${TABLE#* }"
+        srv_name="${TABLE_SRV#* }"
+        if [[ -d "$OVERRIDE_DIR" ]]; then
+            for d in "${OVERRIDE_DIR}"/*/; do
+                [[ -d "$d" ]] || continue
+                name="$(basename "$d")"
+                if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                    echo "УВАГА: каталог ${d} -- не легітимний nft-ідентифікатор, пропускаю як додаткову srv-таблицю." >&2
+                    continue
+                fi
+                if [[ "$name" == "$main_name" || "$name" == "$srv_name" ]]; then
+                    echo "УВАГА: каталог ${d} збігається з назвою вже наявної таблиці (${main_name}/${srv_name}), пропускаю." >&2
+                    continue
+                fi
+                result+="${name}"$'\n'
+            done
+        fi
+        EXTRA_SRV_DIRS_CACHE=$(printf '%s' "$result" | sort -u)
+        EXTRA_SRV_DIRS_CACHED=1
+    fi
+    [[ -n "$EXTRA_SRV_DIRS_CACHE" ]] && printf '%s\n' "$EXTRA_SRV_DIRS_CACHE"
+    return 0
+}
+
+# list_all_tables -- друкує повне "${TABLE_FAMILY} назва" по рядку для УСІХ
+# відомих таблиць: ${TABLE}, ${TABLE_SRV}, і кожної додаткової srv-таблиці
+# (discover_extra_srv_dirs). Єдине місце, де це перераховується -- do_stop_fwd/
+# do_stop_all/main() (фінальний список) використовують саме його, щоб не
+# дублювати перелік.
+list_all_tables() {
+    echo "${TABLE}"
+    echo "${TABLE_SRV}"
+    local extra_dir
+    while IFS= read -r extra_dir; do
+        [[ -z "$extra_dir" ]] && continue
+        echo "${TABLE_FAMILY} ${extra_dir}"
+    done < <(discover_extra_srv_dirs)
+}
+
 # Знімає елементи всіх dynamic/timeout сетів живої ТАБЛИЦІ (перший
-# аргумент -- ${TABLE} чи ${TABLE_SRV}: scan/level* живуть в одній, srv_*
-# в іншій) разом із рештою таймауту -- ДОДАЄ у $LIVE_STATE_FILE (не
-# перезаписує -- викликається по разу на кожну з двох таблиць у main()/
-# do_stop_all(), обидва знімки лягають в один файл; колізій імен сетів між
+# аргумент -- ${TABLE}, ${TABLE_SRV} чи одна з додаткових srv-таблиць:
+# scan/level* живуть лише в ${TABLE}, srv_* -- у кожній srv-таблиці) разом
+# із рештою таймауту -- ДОДАЄ у $LIVE_STATE_FILE (не перезаписує --
+# викликається по разу на кожну відому таблицю в main()/do_stop_all() через
+# list_all_tables, усі знімки лягають в один файл; колізій імен сетів між
 # таблицями нема, тож однозначність за самою лише назвою зберігається), по
 # рядку "назва_сету<TAB>значення<TAB>решта_секунд". Статичних interval-сетів
-# (trusted/ignore/permanentBlock, тепер дубльованих в обох таблицях) це не
+# (trusted/ignore/permanentBlock, тепер дубльованих в усіх таблицях) це не
 # стосується -- вони йдуть через override-файли і в дамп не потрапляють (у
 # них нема flags timeout).
 capture_live_state() {
@@ -729,8 +854,9 @@ capture_live_state() {
 # сету, друкує "add element TABLE SET_NAME { val1 timeout Ns, val2 timeout
 # Ms }". Викликається одразу після відповідного "add set" -- в тій самій
 # транзакції. TABLE явним аргументом (не глобальний ${TABLE}), бо тепер
-# сети живуть у двох різних таблицях (${TABLE} для scan/level*, ${TABLE_SRV}
-# для srv_*) -- викликач сам знає, у контексті якої з двох він зараз.
+# сети живуть у кількох різних таблицях (${TABLE} для scan/level*,
+# ${TABLE_SRV} і додаткові srv-таблиці для srv_*) -- викликач сам знає, у
+# контексті якої саме він зараз.
 emit_restore() {
     local table="$1" set_name="$2"
     [[ -s "$LIVE_STATE_FILE" ]] || return 0
@@ -796,28 +922,32 @@ gen_level_sets() {
 }
 
 gen_srv_block_set() {
-    # Завжди в ${TABLE_SRV} -- захист протокол-груп живе в окремій таблиці
+    # gen_srv_block_set TABLE FAMILY PREFIX -- TABLE тепер явний аргумент:
+    # окрім головної ${TABLE_SRV}, те саме генерується й для кожної
+    # додаткової srv-таблиці (discover_extra_srv_dirs), кожна своя, окрема
     # від драбини level*/scan, див. коментар на початку файлу.
-    local family="$1" prefix="$2"     # ipv4_addr|ipv6_addr ; srv_|srv6_
-    echo "add set ${TABLE_SRV} ${prefix}block { type ${family}; size 65535; flags dynamic,timeout; timeout ${SRV_BLOCK_TIMEOUT}; comment \"Service Block\"; }"
-    emit_restore "${TABLE_SRV}" "${prefix}block"
+    local table="$1" family="$2" prefix="$3"     # ipv4_addr|ipv6_addr ; srv_|srv6_
+    echo "add set ${table} ${prefix}block { type ${family}; size 65535; flags dynamic,timeout; timeout ${SRV_BLOCK_TIMEOUT}; comment \"Service Block\"; }"
+    emit_restore "${table}" "${prefix}block"
 }
 
 gen_srv_rules() {
-    # gen_srv_rules CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
+    # gen_srv_rules TABLE CHAIN PROTO PREFIX L4MATCH IFACE_MATCH
     # L4MATCH -- напр. "tcp dport { 80, 443 }".
     #
     # Захист побудований на двох nftables `meter` (per-source token bucket
     # + per-source concurrent-connection cap) замість сетового каскаду
     # normal/check0/check1 -- див. TESTS.md за повним порівнянням і причиною.
-    # Усе це живе в ${TABLE_SRV} (окрема таблиця від level*/scan). srv_block/
-    # srv6_block лишається звичайним `set`, СПІЛЬНИМ для всіх викликів
-    # gen_srv_rules (input, кожен forward-bridge, кожна протокол-група) --
-    # той самий "хто вже спійманий" список скрізь. А от rl_N/over_N -- саме
-    # meter, і nftables не дозволяє повторне використання того самого імені
-    # meter у двох різних правилах, тож кожен виклик отримує СВІЙ, унікальний
-    # за SRV_METER_IDX -- rate/over-бюджет per (chain × bridge × протокол-
-    # група), не спільний, як був у сетовому каскаді.
+    # Усе це живе в TABLE (окрема від level*/scan -- або головна ${TABLE_SRV},
+    # або одна з додаткових srv-таблиць). srv_block/srv6_block лишається
+    # звичайним `set`, СПІЛЬНИМ для всіх викликів gen_srv_rules у межах ОДНІЄЇ
+    # TABLE (input, кожен forward-bridge, кожна протокол-група) -- той самий
+    # "хто вже спійманий" список скрізь усередині цієї таблиці. А от rl_N/
+    # over_N -- саме meter, і nftables не дозволяє повторне використання
+    # того самого імені meter у двох різних правилах, тож кожен виклик
+    # отримує СВІЙ, унікальний за SRV_METER_IDX -- rate/over-бюджет per
+    # (chain × bridge × протокол-група), не спільний, як був у сетовому
+    # каскаді.
     #
     # Перший рядок нижче -- permanentBlock, повторно, тепер ще й СКОПОВАНИЙ
     # на L4MATCH (на відміну від чейн-широкого permanentBlock-дропу в
@@ -826,30 +956,30 @@ gen_srv_rules() {
     # для окремого, per-протокол-група лічильника: "скільки permanentBlock
     # трафіку прицільно било саме в захищені порти", той самий принцип
     # гранулярності, що й окремі копії guard-правил на кожен forward-бридж.
-    local chain="$1" proto="$2" prefix="$3" l4match="$4" ifm="${5:-}"
+    local table="$1" chain="$2" proto="$3" prefix="$4" l4match="$5" ifm="${6:-}"
     local block="${prefix}block"
     local rl="${prefix}rl_${SRV_METER_IDX}" over="${prefix}over_${SRV_METER_IDX}"
     local permblock="permanentBlock"
     [[ "$proto" == "ip6" ]] && permblock="permanentBlock6"
     SRV_METER_IDX=$((SRV_METER_IDX + 1))
-    echo "add rule ${TABLE_SRV} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${permblock} counter drop"
-    echo "add rule ${TABLE_SRV} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
-    echo "add rule ${TABLE_SRV} ${chain} ${ifm}${l4match} ct state new meter ${over} { ${proto} saddr ct count over ${SRV_OVER} } add @${block} { ${proto} saddr } counter drop"
-    echo "add rule ${TABLE_SRV} ${chain} ${ifm}${l4match} ct state new meter ${rl} { ${proto} saddr limit rate ${SRV_RATE} burst ${SRV_BURST} packets } counter return"
-    echo "add rule ${TABLE_SRV} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} add @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${table} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${permblock} counter drop"
+    echo "add rule ${table} ${chain} ${ifm}${l4match} ct state new ${proto} saddr @${block} update @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${table} ${chain} ${ifm}${l4match} ct state new meter ${over} { ${proto} saddr ct count over ${SRV_OVER} } add @${block} { ${proto} saddr } counter drop"
+    echo "add rule ${table} ${chain} ${ifm}${l4match} ct state new meter ${rl} { ${proto} saddr limit rate ${SRV_RATE} burst ${SRV_BURST} packets } counter return"
+    echo "add rule ${table} ${chain} ${ifm}${l4match} ct state new ${proto} saddr != @${block} add @${block} { ${proto} saddr } counter drop"
 }
 
-# gen_srv_rules_all_ports CHAIN PROTO PREFIX IFACE_MATCH -- викликає
+# gen_srv_rules_all_ports TABLE CHAIN PROTO PREFIX IFACE_MATCH -- викликає
 # gen_srv_rules по разу на кожну протокол-групу з $SRV_PORT_GROUPS
 # ("proto:port1,port2" по рядку, див. read_srv_port_groups).
 gen_srv_rules_all_ports() {
-    local chain="$1" proto="$2" prefix="$3" ifm="${4:-}"
+    local table="$1" chain="$2" proto="$3" prefix="$4" ifm="${5:-}"
     local group l4proto ports
     while IFS= read -r group; do
         [[ -z "$group" ]] && continue
         l4proto="${group%%:*}"
         ports="${group#*:}"
-        gen_srv_rules "$chain" "$proto" "$prefix" "${l4proto} dport { ${ports} }" "$ifm"
+        gen_srv_rules "$table" "$chain" "$proto" "$prefix" "${l4proto} dport { ${ports} }" "$ifm"
     done <<< "$SRV_PORT_GROUPS"
 }
 
@@ -873,10 +1003,11 @@ gen_level_rules() {
 gen_static_guard_rules() {
     # permanentBlock / trusted / ignore -- для input (без iface-match) чи
     # forward (з ним). TABLE явним аргументом -- ці три сети тепер
-    # ДУБЛЬОВАНІ в обох таблицях (${TABLE} і ${TABLE_SRV}), кожна зі своїм
-    # `return`, що виходить лише з ВЛАСНОГО chain (nftables не пропускає
-    # інші table/chain на тому самому hook через return однієї з них) --
-    # тож "довіру"/"ігнор" з правильно спрацьовує в обох незалежно.
+    # ДУБЛЬОВАНІ в УСІХ таблицях (${TABLE}, ${TABLE_SRV} і кожна додаткова
+    # srv-таблиця), кожна зі своїм `return`, що виходить лише з ВЛАСНОГО
+    # chain (nftables не пропускає інші table/chain на тому самому hook
+    # через return однієї з них) -- тож "довіру"/"ігнор" правильно
+    # спрацьовує в кожній незалежно.
     local table="$1" chain="$2" ifm="${3:-}"
     echo "add rule ${table} ${chain} ${ifm}ip saddr @permanentBlock counter drop"
     echo "add rule ${table} ${chain} ${ifm}ct state new ip saddr @trusted counter return"
@@ -934,6 +1065,99 @@ seed_all_config_if_missing() {
     seed_srv_ports_if_missing
     seed_srv_timeouts_if_missing
     seed_extra_forward_ifaces_if_missing
+
+    # Додаткові srv-таблиці -- каталоги вже мусять існувати (адмін створює
+    # їх сам, `mkdir /etc/nft-scandetect/<назва>`); тут лише досіюємо
+    # відсутні srv_ports/srv_timeouts УСЕРЕДИНІ вже наявних каталогів, самі
+    # каталоги не створюємо.
+    local extra_dir
+    while IFS= read -r extra_dir; do
+        [[ -z "$extra_dir" ]] && continue
+        seed_srv_ports_if_missing "$extra_dir"
+        seed_srv_timeouts_if_missing "$extra_dir"
+    done < <(discover_extra_srv_dirs)
+}
+
+# build_srv_table TABLE SUBDIR PRIORITY -- генерує повний ruleset ОДНІЄЇ
+# srv-протектор-подібної таблиці (delete+add table, статичні сети,
+# srv_block(6), chain'и input/forward із захистом протокол-груп). TABLE --
+# повне "${TABLE_FAMILY} назва". SUBDIR -- порожньо для головної ${TABLE_SRV}
+# (srv_ports/srv_timeouts у корені ${OVERRIDE_DIR}), інакше -- назва
+# каталогу під ${OVERRIDE_DIR} (для додаткових таблиць,
+# discover_extra_srv_dirs) -- srv_ports/srv_timeouts читаються звідти,
+# решта (trusted/ignore/permanent(6)/forward_ifaces/NO_IPV6) успадковується
+# з глобальних змінних build_ruleset (той самий патерн, що й SRV_RATE/
+# SRV_BURST/тощо, які так само глобальні для gen_srv_rules) -- жодних
+# власних override-файлів для цього в додаткової таблиці нема.
+build_srv_table() {
+    local table="$1" subdir="$2" tbl_priority="$3"
+
+    local srv_lines st_line
+    srv_lines=$(read_srv_timeouts "$subdir")
+    while IFS= read -r st_line; do
+        [[ -z "$st_line" ]] && continue
+        case "${st_line%%:*}" in
+            rate)  SRV_RATE="${st_line#*:}" ;;
+            burst) SRV_BURST="${st_line#*:}" ;;
+            over)  SRV_OVER="${st_line#*:}" ;;
+            block) SRV_BLOCK_TIMEOUT="${st_line#*:}" ;;
+        esac
+    done <<< "$srv_lines"
+    SRV_METER_IDX=0
+    SRV_PORT_GROUPS=$(read_srv_port_groups "$subdir")
+
+    # "add table" перед "delete table" -- та сама причина, що й для ${TABLE}
+    # вище (гарантія існування на момент видалення).
+    echo "add table ${table}"
+    echo "delete table ${table}"
+    echo "add table ${table}"
+
+    echo "add set ${table} trusted { type ipv4_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
+    [[ -n "$trusted" ]] && echo "add element ${table} trusted { ${trusted} }"
+    echo "add set ${table} ignore { type ipv4_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
+    [[ -n "$ignore" ]] && echo "add element ${table} ignore { ${ignore} }"
+    echo "add set ${table} permanentBlock { type ipv4_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
+    [[ -n "$permanent" ]] && echo "add element ${table} permanentBlock { ${permanent} }"
+
+    if [[ $NO_IPV6 -eq 0 ]]; then
+        echo "add set ${table} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
+        [[ -n "$trusted6" ]] && echo "add element ${table} trusted6 { ${trusted6} }"
+        echo "add set ${table} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
+        [[ -n "$ignore6" ]] && echo "add element ${table} ignore6 { ${ignore6} }"
+        echo "add set ${table} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
+        [[ -n "$permanent6" ]] && echo "add element ${table} permanentBlock6 { ${permanent6} }"
+        gen_srv_block_set "$table" ipv6_addr srv6_
+    fi
+
+    gen_srv_block_set "$table" ipv4_addr srv_
+
+    echo "add chain ${table} input { type filter hook input priority ${tbl_priority}; }"
+
+    gen_static_guard_rules "$table" input
+    gen_srv_rules_all_ports "$table" input ip srv_
+
+    if [[ $NO_IPV6 -eq 0 ]]; then
+        gen_static_guard6_rules "$table" input
+        gen_srv_rules_all_ports "$table" input ip6 srv6_
+    fi
+
+    if [[ -n "$forward_ifaces" ]]; then
+        echo "add chain ${table} forward { type filter hook forward priority ${tbl_priority}; }"
+
+        local iface ifm
+        while read -r iface; do
+            [[ -z "$iface" ]] && continue
+            ifm="iifname != ${iface} oifname ${iface} "
+
+            gen_static_guard_rules "$table" forward "$ifm"
+            gen_srv_rules_all_ports "$table" forward ip srv_ "$ifm"
+
+            if [[ $NO_IPV6 -eq 0 ]] && ipv6_enabled_for_iface "$iface"; then
+                gen_static_guard6_rules "$table" forward "$ifm"
+                gen_srv_rules_all_ports "$table" forward ip6 srv6_ "$ifm"
+            fi
+        done <<< "$forward_ifaces"
+    fi
 }
 
 # --- побудова повного ruleset ---
@@ -941,7 +1165,12 @@ seed_all_config_if_missing() {
 build_ruleset() {
     seed_all_config_if_missing
 
-    local trusted ignore permanent trusted6 ignore6 permanent6 priority srv_priority
+    # НЕ local: trusted/ignore/permanent(6)/forward_ifaces читаються ще й
+    # у build_srv_table нижче (окрема функція, викликається для ${TABLE_SRV}
+    # і для кожної додаткової srv-таблиці) -- той самий патерн, що й
+    # SRV_RATE/SRV_BURST/тощо, які так само глобальні й читаються
+    # gen_srv_rules. priority лишається local -- потрібен лише тут.
+    local priority srv_priority
     priority=$(read_priority)
     # ${TABLE_SRV} завжди на priority-1 -- нижче число, спрацьовує РАНІШЕ
     # ${TABLE}, щоб srv_* і далі відсікав джерело до того, як пакет дійде до
@@ -963,23 +1192,9 @@ build_ruleset() {
     LAST_LEVEL=$(( ${#LEVEL_TIMEOUTS[@]} - 1 ))
     scan_timeout=$(read_scan_timeout)
 
-    # ефективні ліміти srv_* -- rate/burst/over/block, gen_srv_rules/
-    # gen_srv_block_set читають їх напряму з глобальних SRV_*
-    local srv_lines st_line
-    srv_lines=$(read_srv_timeouts)
-    while IFS= read -r st_line; do
-        [[ -z "$st_line" ]] && continue
-        case "${st_line%%:*}" in
-            rate)  SRV_RATE="${st_line#*:}" ;;
-            burst) SRV_BURST="${st_line#*:}" ;;
-            over)  SRV_OVER="${st_line#*:}" ;;
-            block) SRV_BLOCK_TIMEOUT="${st_line#*:}" ;;
-        esac
-    done <<< "$srv_lines"
-    SRV_METER_IDX=0
-
-    # ефективні захищені порти, згруповані по протоколу -- для gen_srv_rules_all_ports
-    SRV_PORT_GROUPS=$(read_srv_port_groups)
+    # ефективні ліміти/порти srv_* -- це тепер робота build_srv_table нижче
+    # (окремо для ${TABLE_SRV} і кожної додаткової таблиці, кожна зі своїм
+    # SUBDIR), тут більше не читаємо.
 
     trusted=$(list_elements    "$BASE_TRUSTED"    "${OVERRIDE_DIR}/trusted-extra.list")
     ignore=$(list_elements     "$BASE_IGNORE"     "${OVERRIDE_DIR}/ignore-extra.list")
@@ -988,11 +1203,11 @@ build_ruleset() {
     ignore6=$(list_elements    "$BASE_IGNORE6"    "${OVERRIDE_DIR}/ignore6-extra.list")
     permanent6=$(list_elements "$BASE_PERMANENT6" "${OVERRIDE_DIR}/permanent6-extra.list")
 
-    # forward-інтерфейси -- СПІЛЬНІ для обох таблиць (той самий перелік
+    # forward-інтерфейси -- СПІЛЬНІ для ВСІХ таблиць (той самий перелік
     # docker-бриджів + extra_forward_ifaces), рахуємо один раз тут, ще до
-    # побудови будь-якої з двох. NO_DOCKER не означає "forward не
+    # побудови будь-якої з них. NO_DOCKER не означає "forward не
     # будується взагалі" -- лише "docker-бриджі автоматично не підхоплюються".
-    local forward_ifaces
+    # НЕ local -- читається в build_srv_table нижче.
     forward_ifaces=$( { [[ $NO_DOCKER -eq 0 ]] && get_docker_bridges; read_extra_forward_ifaces; } | sort -u)
 
     # =========================================================================
@@ -1073,92 +1288,51 @@ build_ruleset() {
     fi
 
     # =========================================================================
-    # ${TABLE_SRV} -- захист протокол-груп (srv_*, meter-based). ОКРЕМА
-    # таблиця -- пріоритет ${srv_priority} (priority-1, спрацьовує РАНІШЕ за
-    # ${TABLE}). permanentBlock/trusted/ignore (і v6-варіанти) ДУБЛЬОВАНІ тут
-    # із тими самими елементами, що й вище в ${TABLE} -- return у trusted/
-    # ignore виходить лише з ВЛАСНОГО chain, тож кожна таблиця має власні
-    # копії; єдине джерело правди для обох лишається те саме (override-файли,
-    # прочитані один раз на початку build_ruleset).
+    # Захист протокол-груп (srv_*, meter-based) -- ГОЛОВНА ${TABLE_SRV} і всі
+    # ДОДАТКОВІ srv-таблиці (discover_extra_srv_dirs, підкаталоги
+    # ${OVERRIDE_DIR}). Кожна -- окрема build_srv_table (нижче): своя
+    # table inet, свій priority (менший за ${priority}, у головної завжди
+    # ${srv_priority}=priority-1, у додаткових -- read_extra_priority), свої
+    # srv_ports/srv_timeouts; permanentBlock/trusted/ignore (і v6) ДУБЛЬОВАНІ
+    # з тими самими елементами, що й у ${TABLE} вище -- return виходить лише
+    # з ВЛАСНОГО chain, тож кожна таблиця має власні копії; єдине джерело
+    # правди лишається те саме (override-файли, прочитані один раз вище).
     # =========================================================================
 
-    echo "add table ${TABLE_SRV}"
-    echo "delete table ${TABLE_SRV}"
-    echo "add table ${TABLE_SRV}"
+    build_srv_table "${TABLE_SRV}" "" "$srv_priority"
 
-    echo "add set ${TABLE_SRV} trusted { type ipv4_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
-    [[ -n "$trusted" ]] && echo "add element ${TABLE_SRV} trusted { ${trusted} }"
-    echo "add set ${TABLE_SRV} ignore { type ipv4_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
-    [[ -n "$ignore" ]] && echo "add element ${TABLE_SRV} ignore { ${ignore} }"
-    echo "add set ${TABLE_SRV} permanentBlock { type ipv4_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
-    [[ -n "$permanent" ]] && echo "add element ${TABLE_SRV} permanentBlock { ${permanent} }"
-
-    if [[ $NO_IPV6 -eq 0 ]]; then
-        echo "add set ${TABLE_SRV} trusted6 { type ipv6_addr; flags interval; auto-merge; comment \"Trusted Sources\"; }"
-        [[ -n "$trusted6" ]] && echo "add element ${TABLE_SRV} trusted6 { ${trusted6} }"
-        echo "add set ${TABLE_SRV} ignore6 { type ipv6_addr; flags interval; auto-merge; comment \"Excluded Sources\"; }"
-        [[ -n "$ignore6" ]] && echo "add element ${TABLE_SRV} ignore6 { ${ignore6} }"
-        echo "add set ${TABLE_SRV} permanentBlock6 { type ipv6_addr; flags interval; auto-merge; comment \"Permanent Block\"; }"
-        [[ -n "$permanent6" ]] && echo "add element ${TABLE_SRV} permanentBlock6 { ${permanent6} }"
-        gen_srv_block_set ipv6_addr srv6_
-    fi
-
-    gen_srv_block_set ipv4_addr srv_
-
-    echo "add chain ${TABLE_SRV} input { type filter hook input priority ${srv_priority}; }"
-
-    gen_static_guard_rules "${TABLE_SRV}" input
-    gen_srv_rules_all_ports input ip srv_
-
-    if [[ $NO_IPV6 -eq 0 ]]; then
-        gen_static_guard6_rules "${TABLE_SRV}" input
-        gen_srv_rules_all_ports input ip6 srv6_
-    fi
-
-    if [[ -n "$forward_ifaces" ]]; then
-        echo "add chain ${TABLE_SRV} forward { type filter hook forward priority ${srv_priority}; }"
-
-        local iface ifm
-        while read -r iface; do
-            [[ -z "$iface" ]] && continue
-            ifm="iifname != ${iface} oifname ${iface} "
-
-            gen_static_guard_rules "${TABLE_SRV}" forward "$ifm"
-            gen_srv_rules_all_ports forward ip srv_ "$ifm"
-
-            if [[ $NO_IPV6 -eq 0 ]] && ipv6_enabled_for_iface "$iface"; then
-                gen_static_guard6_rules "${TABLE_SRV}" forward "$ifm"
-                gen_srv_rules_all_ports forward ip6 srv6_ "$ifm"
-            fi
-        done <<< "$forward_ifaces"
-    fi
+    local extra_dir
+    while IFS= read -r extra_dir; do
+        [[ -z "$extra_dir" ]] && continue
+        build_srv_table "${TABLE_FAMILY} ${extra_dir}" "$extra_dir" "$(read_extra_priority "$extra_dir" "$priority")"
+    done < <(discover_extra_srv_dirs)
 
     return 0
 }
 
 # --- --stop-fwd / --stop-fwd-docker ---
 
-# Атомарно знімає ланцюг forward з ОБОХ живих таблиць (одна мінітранзакція,
+# Атомарно знімає ланцюг forward з УСІХ живих таблиць (одна мінітранзакція,
 # теж через nft -c -f -> nft -f) -- input, усі сети й live-стан в жодній не
 # чіпає. Щоб повернути forward -- достатньо звичайного запуску nft-scan-detector.
 do_stop_fwd() {
     local tmpfile any=0 t
     tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
 
-    for t in "${TABLE}" "${TABLE_SRV}"; do
+    while IFS= read -r t; do
         if sudo nft list chain ${t} forward >/dev/null 2>&1; then
             echo "delete chain ${t} forward" >> "$tmpfile"
             any=1
         fi
-    done
+    done < <(list_all_tables)
 
     if [[ $any -eq 0 ]]; then
-        echo "Ланцюг forward відсутній в обох таблицях -- нічого знімати." >&2
+        echo "Ланцюг forward відсутній в жодній таблиці -- нічого знімати." >&2
         rm -f "$tmpfile"
         return 0
     fi
 
-    echo "Знімаю ланцюг forward (docker-правила scanDetector/srvProtector)..." >&2
+    echo "Знімаю ланцюг forward (docker-правила усіх таблиць)..." >&2
     if ! sudo nft -c -f "$tmpfile"; then
         echo "Помилка синтаксису під час зняття forward -- нічого не чіпаю." >&2
         rm -f "$tmpfile"
@@ -1166,7 +1340,7 @@ do_stop_fwd() {
     fi
     sudo nft -f "$tmpfile"
     rm -f "$tmpfile"
-    echo "Ланцюг forward знято в обох таблицях. input і всі сети (live-стан) лишились без змін." >&2
+    echo "Ланцюг forward знято в усіх таблицях. input і всі сети (live-стан) лишились без змін." >&2
 }
 
 do_stop_docker() {
@@ -1178,30 +1352,32 @@ do_stop_docker() {
 
 # --- --stop ---
 
-# Атомарно прибирає ОБИДВІ таблиці (${TABLE} і ${TABLE_SRV}) із системи
-# ПОВНІСТЮ (delete table -- і input, і forward, і всі сети йдуть разом з
-# кожною). На відміну від do_stop_fwd, це залишає хост і docker-мережі
-# зовсім без захисту. Live-стан (scan/level* з ${TABLE#* }, srv_* з
-# ${TABLE_SRV#* }) перед видаленням лягає у ЄДИНИЙ PENDING_STATE_FILE --
-# перший наступний звичайний запуск (systemctl start/restart чи просто
-# nft-scan-detector без прапорців) підхопить його й відновить обидві.
+# Атомарно прибирає УСІ відомі таблиці (${TABLE}, ${TABLE_SRV}, і кожну
+# додаткову srv-таблицю) із системи ПОВНІСТЮ (delete table -- і input, і
+# forward, і всі сети йдуть разом з кожною). На відміну від do_stop_fwd, це
+# залишає хост і docker-мережі зовсім без захисту. Live-стан кожної перед
+# видаленням лягає у ЄДИНИЙ PENDING_STATE_FILE -- перший наступний звичайний
+# запуск (systemctl start/restart чи просто nft-scan-detector без
+# прапорців) підхопить його й відновить усі одразу.
 do_stop_all() {
-    local t exists_scan=0 exists_srv=0
-    sudo nft list table ${TABLE} >/dev/null 2>&1 && exists_scan=1
-    sudo nft list table ${TABLE_SRV} >/dev/null 2>&1 && exists_srv=1
+    local t existing=()
+    while IFS= read -r t; do
+        sudo nft list table ${t} >/dev/null 2>&1 && existing+=("$t")
+    done < <(list_all_tables)
 
-    if [[ $exists_scan -eq 0 && $exists_srv -eq 0 ]]; then
-        echo "Таблиці ${TABLE} і ${TABLE_SRV} відсутні -- нічого прибирати." >&2
+    if [[ ${#existing[@]} -eq 0 ]]; then
+        echo "Жодної відомої таблиці немає -- нічого прибирати." >&2
         return 0
     fi
 
     sudo mkdir -p "$AUDIT_DIR"
     LIVE_STATE_FILE=$(mktemp /tmp/nft-scandetect.XXXXXX.state)
-    [[ $exists_scan -eq 1 ]] && capture_live_state "${TABLE}"
-    [[ $exists_srv -eq 1 ]] && capture_live_state "${TABLE_SRV}"
+    for t in "${existing[@]}"; do
+        capture_live_state "$t"
+    done
     if [[ -s "$LIVE_STATE_FILE" ]]; then
         sudo cp "$LIVE_STATE_FILE" "$PENDING_STATE_FILE"
-        echo "Live-стан каскаду (scan/level* з ${TABLE#* }, srv_* з ${TABLE_SRV#* }) збережено -- відновиться при наступному запуску." >&2
+        echo "Live-стан усіх таблиць збережено -- відновиться при наступному запуску." >&2
     else
         sudo rm -f "$PENDING_STATE_FILE"
     fi
@@ -1209,10 +1385,11 @@ do_stop_all() {
 
     local tmpfile
     tmpfile=$(mktemp /tmp/nft-scandetect.XXXXXX.nft)
-    [[ $exists_scan -eq 1 ]] && echo "delete table ${TABLE}" >> "$tmpfile"
-    [[ $exists_srv -eq 1 ]] && echo "delete table ${TABLE_SRV}" >> "$tmpfile"
+    for t in "${existing[@]}"; do
+        echo "delete table ${t}" >> "$tmpfile"
+    done
 
-    echo "Прибираю таблиці (${TABLE}, ${TABLE_SRV}) із системи повністю..." >&2
+    echo "Прибираю таблиці (${existing[*]}) із системи повністю..." >&2
     if ! sudo nft -c -f "$tmpfile"; then
         echo "Помилка синтаксису під час видалення таблиць -- нічого не чіпаю." >&2
         rm -f "$tmpfile"
@@ -1254,8 +1431,10 @@ main() {
         echo "Відновлюю live-стан із відкладеного знімка (залишеного попереднім --stop)." >&2
     else
         sudo rm -f "$PENDING_STATE_FILE"
-        capture_live_state "${TABLE}"
-        capture_live_state "${TABLE_SRV}"
+        local t
+        while IFS= read -r t; do
+            capture_live_state "$t"
+        done < <(list_all_tables)
     fi
     sudo cp "$LIVE_STATE_FILE" "${AUDIT_DIR}/live-state-${ts}.tsv"
 
@@ -1272,9 +1451,19 @@ main() {
     echo "Застосовую атомарно..." >&2
     sudo nft -f "$tmpfile"
 
-    sudo nft list table ${TABLE}
-    sudo nft list table ${TABLE_SRV}
+    local t2
+    while IFS= read -r t2; do
+        sudo nft list table ${t2}
+    done < <(list_all_tables)
 }
+
+# Заповнюємо кеш discover_extra_srv_dirs ОДНИМ прямим викликом (без
+# $(...)/<(...) -- ті форкають підшелл, і встановлений усередині кеш
+# губився б одразу після завершення підшелла). Усі наступні виклики нижче
+# (seed_all_config_if_missing, build_ruleset, list_all_tables) — вже через
+# підстановки, але успадковують ЦЕЙ, уже заповнений кеш від форка, тож
+# повторно каталог не сканують і попередження не дублюють.
+discover_extra_srv_dirs >/dev/null
 
 if [[ $STOP_FWD -eq 1 ]]; then
     do_stop_fwd

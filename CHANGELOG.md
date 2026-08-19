@@ -6,6 +6,38 @@
 ## [Unreleased]
 
 ### Додано
+- **Довільна кількість додаткових srv-таблиць — підкаталоги
+  `/etc/nft-scandetect/<назва>/`.** Продовження винесення `srv_*` в окрему
+  таблицю (нижче): тепер можна мати не лише `srvProtector`, а й скільки
+  завгодно ще таких самих "protector"-подібних таблиць — напр. окрема,
+  суворіша лише для tcp/22, окремо від типової tcp/80+443. Кожен підкаталог
+  `${OVERRIDE_DIR}` — окрема `table inet`, назва = ім'я каталогу (легітимний
+  nft-ідентифікатор, інакше пропускається з попередженням; так само якщо
+  збігається з `scanDetector`/`srvProtector`). Усередині — рівно два файли,
+  той самий формат, що й у корені: `srv_ports`, `srv_timeouts`, і опційно
+  `priority` (валідується: обов'язково менше за основний `priority`,
+  інакше фолбек на `priority-1` з попередженням; без файлу — теж
+  `priority-1`). `trusted`/`ignore`/`permanentBlock`/`ipv6`/
+  `level_timeouts`/`extra_forward_ifaces` своїх override-файлів у
+  підкаталозі НЕ мають — успадковуються з головного конфігу без
+  дублювання. Каталоги створюються вручну (`mkdir`) — `nft-scan-detector`
+  сам їх не створює, лише досіює відсутні `srv_ports`/`srv_timeouts`
+  всередині вже наявних.
+  - `nft-scan-detector`: нові `discover_extra_srv_dirs`/`build_srv_table`/
+    `read_extra_priority`/`list_all_tables`; `build_ruleset` викликає
+    `build_srv_table` для `srvProtector` і для кожної виявленої додаткової
+    таблиці; `--stop`/`--stop-fwd`/`--stop-fwd-docker`/live-state
+    capture-restore тепер працюють по УСІХ відомих таблицях (а не лише
+    двох), через `list_all_tables`.
+  - `scan-detect-tool`: та сама логіка виявлення (`discover_extra_srv_dirs`,
+    `ALL_TABLE_NAMES`) — `--show`/`--add-trusted`/`--add-ignore`/
+    `--add-permanent`/`--list`/`--delete` тепер охоплюють усі відомі
+    таблиці, не лише `scanDetector`/`srvProtector`.
+  - README: новий підрозділ "Додаткові srv-таблиці" в "Назва nft-таблиць";
+    TODO-пункт "Незалежні значення rate/burst/over для різних
+    протокол-груп" — прибрано (реалізовано цим); TODO-пункт "Декілька
+    незалежних інсталяцій — обдумано й відхилено" — теж прибрано (більше
+    нема відкритого питання, яке та нотатка пояснювала).
 - **Захист протокол-груп (`srv_*`) винесено в окрему `table inet srvProtector`**,
   окремо від драбини ескалації `level*`/`scan` у `inet scanDetector`. Дві
   таблиці, прикріплені до тих самих hook'ів (`input`, `forward` per-bridge),

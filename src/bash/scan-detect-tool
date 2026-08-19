@@ -1,17 +1,19 @@
 #!/bin/bash
 
-# scan-detect-tool — керування IP-адресами у двох nft-таблицях:
-# inet scanDetector (драбина level*/scan) та inet srvProtector (захист
-# протокол-груп, srv_*).
+# scan-detect-tool — керування IP-адресами у ВСІХ nft-таблицях проєкту:
+# inet scanDetector (драбина level*/scan), inet srvProtector (захист
+# протокол-груп, srv_*), і кожній додатковій srv-таблиці (підкаталог
+# ${OVERRIDE_DIR}, див. nft-scan-detector --help / README).
 #
 # Працює в парі з nft-scan-detector: обидва скрипти вважають файли в
-# /etc/nft-scandetect єдиним джерелом правди для trusted/ignore/permanentBlock.
-# Ця команда:
+# /etc/nft-scandetect єдиним джерелом правди для trusted/ignore/permanentBlock,
+# і однаково визначають перелік додаткових srv-таблиць (discover_extra_srv_dirs
+# тут -- та сама логіка, що й у nft-scan-detector). Ця команда:
 #   1. редагує відповідний *-extra.list файл (додає/видаляє рядок);
 #   2. одразу застосовує ту саму зміну до ЖИВИХ таблиць через nft -- trusted/
-#      ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в обох таблицях
+#      ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в УСІХ таблицях
 #      (nftables не дозволяє посилатись на сет з іншої таблиці), тож живе
-#      застосування йде в обидві одразу, щоб вони не розійшлись.
+#      застосування йде в усі одразу, щоб вони не розійшлись.
 #
 # Якщо список ще не має override-файлу (перший запуск на цьому списку),
 # файл спершу бутстрапиться поточним станом ЖИВОГО сету (з scanDetector) --
@@ -19,16 +21,17 @@
 #
 # Використання:
 #   scan-detect-tool --delete IP           видалити IP звідусіль (живі сети в
-#                                           ОБОХ таблицях + будь-який
+#                                           УСІХ таблицях + будь-який
 #                                           override-файл, де він є)
-#   scan-detect-tool --add-ignore IP       додати в ignore/ignore6 (в обох таблицях)
-#   scan-detect-tool --add-trusted IP      додати в trusted/trusted6 (в обох таблицях)
+#   scan-detect-tool --add-ignore IP       додати в ignore/ignore6 (в усіх таблицях)
+#   scan-detect-tool --add-trusted IP      додати в trusted/trusted6 (в усіх таблицях)
 #   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
-#                                           (в обох таблицях)
-#   scan-detect-tool --list IP             показати живі сети (в обох таблицях) +
+#                                           (в усіх таблицях)
+#   scan-detect-tool --list IP             показати живі сети (в усіх таблицях) +
 #                                           override-файли, де є IP
-#   scan-detect-tool --show                вивести повністю ОБИДВІ таблиці
-#                                           (inet scanDetector, inet srvProtector)
+#   scan-detect-tool --show                вивести повністю УСІ відомі таблиці
+#                                           (inet scanDetector, inet srvProtector,
+#                                           і кожну додаткову srv-таблицю)
 #   scan-detect-tool --set-priority N      перевизначити пріоритет hook'ів input/forward
 #                                           scanDetector (застосовується рестартом
 #                                           scan-detector.service, не "живим" add
@@ -87,22 +90,55 @@ read_table_name_srv() {
 TABLE_NAME="$(read_table_name)"
 TABLE_NAME_SRV="$(read_table_name_srv)"
 
+# discover_extra_srv_dirs -- та сама логіка, що й в nft-scan-detector
+# (discover_extra_srv_dirs там): кожен підкаталог ${OVERRIDE_DIR} -- окрема
+# додаткова srv-таблиця. Друкує валідні назви по рядку. Обидва скрипти
+# мають бачити той самий перелік -- інакше scan-detect-tool промине живу
+# зміну в таблиці, про яку не знає.
+discover_extra_srv_dirs() {
+    local d name
+    [[ -d "$OVERRIDE_DIR" ]] || return 0
+    for d in "${OVERRIDE_DIR}"/*/; do
+        [[ -d "$d" ]] || continue
+        name="$(basename "$d")"
+        if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            echo "УВАГА: каталог ${d} -- не легітимний nft-ідентифікатор, пропускаю як додаткову srv-таблицю." >&2
+            continue
+        fi
+        if [[ "$name" == "$TABLE_NAME" || "$name" == "$TABLE_NAME_SRV" ]]; then
+            echo "УВАГА: каталог ${d} збігається з назвою вже наявної таблиці (${TABLE_NAME}/${TABLE_NAME_SRV}), пропускаю." >&2
+            continue
+        fi
+        echo "$name"
+    done | sort -u
+}
+
+# ALL_TABLE_NAMES -- усі відомі таблиці (scanDetector, srvProtector, і
+# кожна додаткова), масив назв (без родини). Рахується один раз тут --
+# усі команди нижче (--show/--add-*/--list/--delete) ітеруються по ньому
+# замість жорстко прописаних TABLE_NAME/TABLE_NAME_SRV.
+ALL_TABLE_NAMES=("$TABLE_NAME" "$TABLE_NAME_SRV")
+while IFS= read -r _extra; do
+    [[ -z "$_extra" ]] && continue
+    ALL_TABLE_NAMES+=("$_extra")
+done < <(discover_extra_srv_dirs)
+
 usage() {
     cat <<EOF
 Використання: $(basename "$0") [--dry-run] КОМАНДА АРГУМЕНТ
 
 Команди:
-  --delete IP           Видалити IP з усіх живих сетів ОБОХ таблиць і з усіх
+  --delete IP           Видалити IP з усіх живих сетів УСІХ таблиць і з усіх
                          override-файлів, де він знайдений
-  --add-ignore IP        Додати IP в ignore (ignore6 для IPv6) -- в ОБОХ таблицях
-  --add-trusted IP       Додати IP в trusted (trusted6 для IPv6) -- в ОБОХ таблицях
+  --add-ignore IP        Додати IP в ignore (ignore6 для IPv6) -- в усіх таблицях
+  --add-trusted IP       Додати IP в trusted (trusted6 для IPv6) -- в усіх таблицях
   --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
-                         -- в ОБОХ таблицях
-  --list IP              Показати живі сети (в ОБОХ таблицях) та override-файли,
+                         -- в усіх таблицях
+  --list IP              Показати живі сети (в усіх таблицях) та override-файли,
                          де присутній IP
-  --show                 Вивести повністю ОБИДВІ живі таблиці (nft list table
-                         inet scanDetector; inet srvProtector) -- усі сети й
-                         правила як є зараз
+  --show                 Вивести повністю УСІ живі таблиці (nft list table
+                         inet scanDetector; inet srvProtector; і кожну
+                         додаткову srv-таблицю) -- усі сети й правила як є зараз
   --set-priority N       Перевизначити пріоритет hook'ів input/forward
                          scanDetector (ціле число, дефолт -50). На відміну
                          від інших команд застосовується не одразу в живих
@@ -119,6 +155,13 @@ usage() {
   --init                 Досіяти відсутні override-файли вбудованими
                          дефолтами (делегує nft-scan-detector --init).
                          Живих таблиць не чіпає, аргументу не потребує.
+
+Додаткові srv-таблиці (окремо від srvProtector) -- підкаталоги
+${OVERRIDE_DIR}, кожен зі своїми srv_ports/srv_timeouts/priority; ця
+команда САМА їх виявляє (той самий перелік, що й nft-scan-detector) і бере
+до уваги в усіх командах вище автоматично -- окремих опцій для керування
+самими підкаталогами тут нема (створюються вручну, mkdir/rmdir; вміст
+srv_ports/srv_timeouts/priority -- звичайним редагуванням файлів).
 
 Опції:
   --dry-run              Показати команди/дії, нічого не застосовуючи
@@ -186,7 +229,7 @@ all_extra_files() {
 # Витягує елементи ЖИВОГО (статичного, interval) сету у вигляді "по одному
 # значенню на рядок" -- враховує і прості значення, і CIDR-об'єкти {"prefix":...}.
 # Читає з ${TABLE_NAME} (scanDetector) -- цього досить для бутстрапу:
-# trusted/ignore/permanentBlock ідентичні в обох таблицях (та сама
+# trusted/ignore/permanentBlock ідентичні в УСІХ таблицях (та сама
 # генерація з тих самих override-файлів), тож не важливо, з якої саме
 # зняти початковий стан.
 live_set_elements() {
@@ -257,13 +300,14 @@ remove_if_present() {
     echo "  - видалено з $file"
 }
 
-# --- пошук IP у живих сетах ОБОХ таблиць (level*/scan* у scanDetector,
-# srv_block/srv6_block і дубльовані trusted/ignore/permanent* у
-# srvProtector) -- друкує "TABLE_NAME<TAB>SET_NAME" по рядку, щоб виклик
-# (cmd_list/cmd_delete) знав, у якій саме таблиці шукати/видаляти елемент.
+# --- пошук IP у живих сетах УСІХ відомих таблиць (level*/scan* у
+# scanDetector, srv_block/srv6_block і дубльовані trusted/ignore/permanent*
+# у кожній srv-таблиці) -- друкує "TABLE_NAME<TAB>SET_NAME" по рядку, щоб
+# виклик (cmd_list/cmd_delete) знав, у якій саме таблиці шукати/видаляти
+# елемент.
 find_live_sets_with_ip() {
     local ip="$1" tname
-    for tname in "$TABLE_NAME" "$TABLE_NAME_SRV"; do
+    for tname in "${ALL_TABLE_NAMES[@]}"; do
         sudo nft -j list table "${TABLE_FAMILY}" "$tname" 2>/dev/null | jq -r --arg ip "$ip" --arg t "$tname" '
             .nftables[]
             | select(.set?)
@@ -287,7 +331,7 @@ cmd_list() {
     local sets
     sets=$(find_live_sets_with_ip "$ip")
     if [[ -z "$sets" ]]; then
-        echo "IP $ip не знайдено в жодному живому сеті таблиць ${TABLE_NAME}/${TABLE_NAME_SRV}."
+        echo "IP $ip не знайдено в жодному живому сеті жодної з таблиць (${ALL_TABLE_NAMES[*]})."
     else
         echo "IP $ip знайдено в живих сетах:"
         echo "$sets" | awk -F'\t' '{print "  - " $1 ": " $2}'
@@ -305,11 +349,13 @@ cmd_list() {
     return 0
 }
 
-# cmd_show -- виводить nft list table для ОБОХ таблиць як є (без --dry-run
-# особливостей: команда й так нічого не змінює, лише читає)
+# cmd_show -- виводить nft list table для УСІХ відомих таблиць як є (без
+# --dry-run особливостей: команда й так нічого не змінює, лише читає)
 cmd_show() {
-    sudo nft list table "${TABLE_FAMILY}" "${TABLE_NAME}"
-    sudo nft list table "${TABLE_FAMILY}" "${TABLE_NAME_SRV}"
+    local tname
+    for tname in "${ALL_TABLE_NAMES[@]}"; do
+        sudo nft list table "${TABLE_FAMILY}" "${tname}"
+    done
 }
 
 cmd_delete() {
@@ -342,10 +388,11 @@ cmd_delete() {
 }
 
 # cmd_add KIND IP  -- KIND: trusted | ignore | permanent
-# trusted/ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в обох таблицях
+# trusted/ignore/permanentBlock (і v6-варіанти) ДУБЛЬОВАНІ в УСІХ таблицях
 # (nftables не дозволяє посилатись на сет з іншої таблиці) -- живе
-# застосування йде в ОБИДВІ, інакше вони розійдуться (IP довірений у
-# scanDetector, але й далі rate/over-лімітується в srvProtector).
+# застосування йде в усі одразу, інакше вони розійдуться (IP довірений у
+# scanDetector, але й далі rate/over-лімітується в srvProtector чи будь-якій
+# додатковій srv-таблиці).
 cmd_add() {
     local kind="$1" ip="$2"
     validate_ip "$ip"
@@ -360,7 +407,7 @@ cmd_add() {
     append_if_missing "$file" "$ip"
 
     local tname
-    for tname in "$TABLE_NAME" "$TABLE_NAME_SRV"; do
+    for tname in "${ALL_TABLE_NAMES[@]}"; do
         run_nft add element "${TABLE_FAMILY}" "$tname" "$set_name" "{ $ip }" \
             || echo "УВАГА: не вдалось застосувати наживо в inet $tname / $set_name (таблиця/сет ще не створені? запустіть nft-scan-detector)." >&2
     done
@@ -447,6 +494,19 @@ _set_table_name_generic() {
     fi
 }
 
+# _name_collides NAME EXCLUDE -- true, якщо NAME збігається з будь-якою вже
+# відомою назвою таблиці (ALL_TABLE_NAMES: scanDetector, srvProtector, і
+# кожна додаткова), крім EXCLUDE (власна поточна назва таблиці, яку саме
+# перейменовуємо -- на неї своя окрема "нічого не змінюю" гілка нижче).
+_name_collides() {
+    local name="$1" exclude="$2" t
+    for t in "${ALL_TABLE_NAMES[@]}"; do
+        [[ "$t" == "$exclude" ]] && continue
+        [[ "$t" == "$name" ]] && return 0
+    done
+    return 1
+}
+
 # cmd_set_table_name NAME -- перевизначає назву таблиці scanDetector
 # (${OVERRIDE_DIR}/table_name).
 cmd_set_table_name() {
@@ -456,8 +516,8 @@ cmd_set_table_name() {
         echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
         exit 1
     fi
-    if [[ "$value" == "$TABLE_NAME_SRV" ]]; then
-        echo "Помилка: '$value' уже назва другої таблиці (srvProtector) -- дві таблиці не можуть мати однакову назву." >&2
+    if _name_collides "$value" "$TABLE_NAME"; then
+        echo "Помилка: '$value' уже назва іншої відомої таблиці (srvProtector чи додаткової) -- назви не можуть збігатися." >&2
         exit 1
     fi
     _set_table_name_generic "${OVERRIDE_DIR}/table_name" "$TABLE_NAME" "$value" "scanDetector"
@@ -472,8 +532,8 @@ cmd_set_table_name_srv() {
         echo "Помилка: '$raw' не схоже на легітимну назву nft-таблиці (літери/цифри/підкреслення, не з цифри)." >&2
         exit 1
     fi
-    if [[ "$value" == "$TABLE_NAME" ]]; then
-        echo "Помилка: '$value' уже назва першої таблиці (scanDetector) -- дві таблиці не можуть мати однакову назву." >&2
+    if _name_collides "$value" "$TABLE_NAME_SRV"; then
+        echo "Помилка: '$value' уже назва іншої відомої таблиці (scanDetector чи додаткової) -- назви не можуть збігатися." >&2
         exit 1
     fi
     _set_table_name_generic "${OVERRIDE_DIR}/table_name_srv" "$TABLE_NAME_SRV" "$value" "srvProtector"
