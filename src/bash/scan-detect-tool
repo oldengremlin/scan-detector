@@ -51,67 +51,24 @@
 
 set -euo pipefail
 
-TABLE_FAMILY="inet"
-DEFAULT_TABLE_NAME="scanDetector"
-DEFAULT_TABLE_NAME_SRV="srvProtector"
-OVERRIDE_DIR="/etc/nft-scandetect"
+# Спільний код з nft-scan-detector: TABLE_FAMILY/OVERRIDE_DIR,
+# DEFAULT_TABLE_NAME(_SRV), read_table_name(_srv), discover_extra_srv_dirs,
+# is_ipv6, validate_ip_element. Перший шлях -- штатне місце після
+# встановлення, другий -- сусідній файл у репозиторії.
+for _c in "/usr/local/lib/nft-scandetect/common.sh" \
+          "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"; do
+    [[ -r "$_c" ]] && { . "$_c"; break; }
+done
+if ! declare -F read_table_name >/dev/null; then
+    echo "Помилка: не знайдено common.sh (ані /usr/local/lib/nft-scandetect/, ані поруч зі скриптом)." >&2
+    exit 1
+fi
+
 DRY_RUN=0
-
-# Читає ${OVERRIDE_DIR}/table_name(_srv) -- той самий формат і фолбек-логіка,
-# що й у nft-scan-detector (read_table_name(_srv) там) -- обидва скрипти
-# мають бачити ту саму назву таблиці, інакше редагування/показ підуть не
-# в ту таблицю.
-read_table_name() {
-    local file="${OVERRIDE_DIR}/table_name" raw
-    if [[ -f "$file" ]]; then
-        raw=$(head -1 "$file" | tr -d '[:space:]')
-        if [[ "$raw" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            echo "$raw"
-            return 0
-        fi
-        echo "УВАГА: $file містить нелегітимну назву таблиці ('$raw') -- використовую дефолт ${DEFAULT_TABLE_NAME}." >&2
-    fi
-    echo "$DEFAULT_TABLE_NAME"
-}
-
-read_table_name_srv() {
-    local file="${OVERRIDE_DIR}/table_name_srv" raw
-    if [[ -f "$file" ]]; then
-        raw=$(head -1 "$file" | tr -d '[:space:]')
-        if [[ "$raw" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            echo "$raw"
-            return 0
-        fi
-        echo "УВАГА: $file містить нелегітимну назву таблиці ('$raw') -- використовую дефолт ${DEFAULT_TABLE_NAME_SRV}." >&2
-    fi
-    echo "$DEFAULT_TABLE_NAME_SRV"
-}
 
 TABLE_NAME="$(read_table_name)"
 TABLE_NAME_SRV="$(read_table_name_srv)"
-
-# discover_extra_srv_dirs -- та сама логіка, що й в nft-scan-detector
-# (discover_extra_srv_dirs там): кожен підкаталог ${OVERRIDE_DIR} -- окрема
-# додаткова srv-таблиця. Друкує валідні назви по рядку. Обидва скрипти
-# мають бачити той самий перелік -- інакше scan-detect-tool промине живу
-# зміну в таблиці, про яку не знає.
-discover_extra_srv_dirs() {
-    local d name
-    [[ -d "$OVERRIDE_DIR" ]] || return 0
-    for d in "${OVERRIDE_DIR}"/*/; do
-        [[ -d "$d" ]] || continue
-        name="$(basename "$d")"
-        if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-            echo "УВАГА: каталог ${d} -- не легітимний nft-ідентифікатор, пропускаю як додаткову srv-таблицю." >&2
-            continue
-        fi
-        if [[ "$name" == "$TABLE_NAME" || "$name" == "$TABLE_NAME_SRV" ]]; then
-            echo "УВАГА: каталог ${d} збігається з назвою вже наявної таблиці (${TABLE_NAME}/${TABLE_NAME_SRV}), пропускаю." >&2
-            continue
-        fi
-        echo "$name"
-    done | sort -u
-}
+warm_extra_srv_dirs_cache
 
 # ALL_TABLE_NAMES -- усі відомі таблиці (scanDetector, srvProtector, і
 # кожна додаткова), масив назв (без родини). Рахується один раз тут --
@@ -170,17 +127,17 @@ EOF
     exit 1
 }
 
-is_ipv6() {
-    [[ "$1" == *:* ]]
-}
-
+# is_ipv6/validate_ip_element -- у common.sh (спільні з nft-scan-detector,
+# який тими самими правилами валідує вміст *-extra.list при читанні).
 validate_ip() {
     local ip="$1"
+    validate_ip_element "$ip" && return 0
     if is_ipv6 "$ip"; then
-        [[ "$ip" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] || { echo "Помилка: '$ip' не схоже на IPv6-адресу" >&2; exit 1; }
+        echo "Помилка: '$ip' не схоже на IPv6-адресу/мережу" >&2
     else
-        [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || { echo "Помилка: '$ip' не схоже на IPv4-адресу" >&2; exit 1; }
+        echo "Помилка: '$ip' не схоже на IPv4-адресу/мережу" >&2
     fi
+    exit 1
 }
 
 # Виконує або друкує nft-команду залежно від --dry-run
