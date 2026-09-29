@@ -20,9 +20,22 @@
 # щоб заводські дефолти з nft-scan-detector (BASE_TRUSTED тощо) не загубились.
 #
 # Використання:
-#   scan-detect-tool --delete IP           видалити IP звідусіль (живі сети в
-#                                           УСІХ таблицях + будь-який
-#                                           override-файл, де він є)
+#   scan-detect-tool --delete IP           видалити IP з "сходинок" (level*/scan*/
+#                                           srv_block* -- живий стан детекції) в
+#                                           УСІХ таблицях. Свідомо ОМИНАЄ trusted/
+#                                           ignore/permanentBlock -- адреса, яку
+#                                           адмін вручну поклав у trusted чи ignore,
+#                                           не має зникнути звідти лише тому, що
+#                                           хтось хоче скинути її прогрес на
+#                                           драбині. Для трьох адміністративних
+#                                           списків -- окремі команди нижче.
+#   scan-detect-tool --delete-trusted IP   прибрати IP з trusted/trusted6 (в усіх
+#                                           таблицях + override-файл)
+#   scan-detect-tool --delete-ignore IP    прибрати IP з ignore/ignore6 (в усіх
+#                                           таблицях + override-файл)
+#   scan-detect-tool --delete-permanent IP прибрати IP з permanentBlock/
+#                                           permanentBlock6 (в усіх таблицях +
+#                                           override-файл)
 #   scan-detect-tool --add-ignore IP       додати в ignore/ignore6 (в усіх таблицях)
 #   scan-detect-tool --add-trusted IP      додати в trusted/trusted6 (в усіх таблицях)
 #   scan-detect-tool --add-permanent IP    додати в permanentBlock/permanentBlock6
@@ -85,8 +98,17 @@ usage() {
 Використання: $(basename "$0") [--dry-run] КОМАНДА АРГУМЕНТ
 
 Команди:
-  --delete IP           Видалити IP з усіх живих сетів УСІХ таблиць і з усіх
-                         override-файлів, де він знайдений
+  --delete IP            Видалити IP зі "сходинок" (level*/scan*/srv_block* --
+                         живий стан детекції) в УСІХ таблицях. Свідомо оминає
+                         trusted/ignore/permanentBlock -- для них окремі команди
+                         нижче, щоб випадковий --delete не виводив адресу з
+                         довірених/ігнорованих списків.
+  --delete-trusted IP    Прибрати IP з trusted (trusted6 для IPv6) -- в усіх
+                         таблицях і з override-файлу
+  --delete-ignore IP     Прибрати IP з ignore (ignore6 для IPv6) -- в усіх
+                         таблицях і з override-файлу
+  --delete-permanent IP  Прибрати IP з permanentBlock (permanentBlock6 для
+                         IPv6) -- в усіх таблицях і з override-файлу
   --add-ignore IP        Додати IP в ignore (ignore6 для IPv6) -- в усіх таблицях
   --add-trusted IP       Додати IP в trusted (trusted6 для IPv6) -- в усіх таблицях
   --add-permanent IP     Додати IP в permanentBlock (permanentBlock6 для IPv6)
@@ -315,32 +337,72 @@ cmd_show() {
     done
 }
 
+# Адміністративні сети (trusted/ignore/permanentBlock і v6-варіанти) --
+# --delete (сходинки, нижче) свідомо їх ОМИНАЄ. Причина: адреса могла
+# опинитись на level*/scan одночасно з тим, що вона в trusted/ignore
+# (адмін додав її туди сам, вручну) -- досі так і мало бути, бо guard-
+# правила (gen_static_guard_rules у nft-scan-detector) раніше пускали
+# `return` лише для `ct state new`, і stealth-вхід у каскад (`ct state
+# invalid` + аномальні прапорці) їх не бачив узагалі -- виправлено окремо,
+# але "довірений/ігнорований, а все одно на драбині" лишається можливим ще
+# якийсь час, доки не перегенерується ruleset. Одна команда --delete не
+# повинна мовчки виводити адресу з trusted/ignore лише тому, що хтось хоче
+# скинути її прогрес на драбині -- це дві різні дії з різними наслідками.
+ADMIN_SET_NAMES=(trusted trusted6 ignore ignore6 permanentBlock permanentBlock6)
+
+_is_admin_set_awk_filter() {
+    printf '$2 != "%s"' "${ADMIN_SET_NAMES[0]}"
+    local s
+    for s in "${ADMIN_SET_NAMES[@]:1}"; do
+        printf ' && $2 != "%s"' "$s"
+    done
+}
+
 cmd_delete() {
     local ip="$1"
     validate_ip "$ip"
 
     local sets
-    sets=$(find_live_sets_with_ip "$ip")
+    sets=$(find_live_sets_with_ip "$ip" | awk -F'\t' "$(_is_admin_set_awk_filter)")
     if [[ -z "$sets" ]]; then
-        echo "IP $ip не знайдено в жодному живому сеті."
+        echo "IP $ip не знайдено в жодному живому сеті \"сходинок\" (level*/scan*/srv_block*)."
     else
-        echo "Видаляю $ip з живих сетів:"
+        echo "Видаляю $ip зі \"сходинок\" (trusted/ignore/permanentBlock свідомо оминаю -- див. --delete-trusted/--delete-ignore/--delete-permanent):"
         while IFS=$'\t' read -r tname set_name; do
             [[ -z "$set_name" ]] && continue
             echo "  - $tname: $set_name"
             run_nft delete element "${TABLE_FAMILY}" "$tname" "$set_name" "{ $ip }"
         done <<< "$sets"
     fi
+    return 0
+}
 
-    echo "Прибираю $ip з override-файлів (якщо є) -- щоб не повернувся після перебудови:"
-    local f any_removed=0
-    while IFS= read -r f; do
-        if [[ -f "$f" ]] && grep -qxF -- "$ip" "$f" 2>/dev/null; then
-            remove_if_present "$f" "$ip"
-            any_removed=1
-        fi
-    done < <(all_extra_files)
-    [[ $any_removed -eq 0 ]] && echo "  (у файлах не знайдено)"
+# cmd_delete_admin KIND IP -- прибирає IP з trusted/ignore/permanent (і
+# v6-варіанту): з живого сету в УСІХ таблицях + з відповідного
+# override-файлу. Дзеркально до cmd_add, тим самим набором
+# set_name_for/extra_file_for.
+cmd_delete_admin() {
+    local kind="$1" ip="$2"
+    validate_ip "$ip"
+
+    local set_name file
+    set_name=$(set_name_for "$kind" "$ip")
+    file=$(extra_file_for "$kind" "$ip")
+
+    local sets
+    sets=$(find_live_sets_with_ip "$ip" | awk -F'\t' -v s="$set_name" '$2 == s')
+    if [[ -z "$sets" ]]; then
+        echo "IP $ip не знайдено в живому сеті $set_name жодної таблиці."
+    else
+        echo "Видаляю $ip з $kind ($set_name):"
+        while IFS=$'\t' read -r tname sname; do
+            [[ -z "$sname" ]] && continue
+            echo "  - $tname: $sname"
+            run_nft delete element "${TABLE_FAMILY}" "$tname" "$sname" "{ $ip }"
+        done <<< "$sets"
+    fi
+
+    remove_if_present "$file" "$ip"
     return 0
 }
 
@@ -518,6 +580,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --delete)
             ACTION="delete"; ARG="${2:-}"; shift 2 ;;
+        --delete-trusted)
+            ACTION="delete-trusted"; ARG="${2:-}"; shift 2 ;;
+        --delete-ignore)
+            ACTION="delete-ignore"; ARG="${2:-}"; shift 2 ;;
+        --delete-permanent)
+            ACTION="delete-permanent"; ARG="${2:-}"; shift 2 ;;
         --add-ignore)
             ACTION="add-ignore"; ARG="${2:-}"; shift 2 ;;
         --add-trusted)
@@ -558,6 +626,9 @@ fi
 
 case "$ACTION" in
     delete)        cmd_delete "$ARG" ;;
+    delete-trusted)   cmd_delete_admin trusted   "$ARG" ;;
+    delete-ignore)    cmd_delete_admin ignore    "$ARG" ;;
+    delete-permanent) cmd_delete_admin permanent "$ARG" ;;
     add-ignore)    cmd_add ignore    "$ARG" ;;
     add-trusted)   cmd_add trusted   "$ARG" ;;
     add-permanent) cmd_add permanent "$ARG" ;;
