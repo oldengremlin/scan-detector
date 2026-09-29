@@ -1069,18 +1069,36 @@ gen_static_guard_rules() {
     # chain (nftables не пропускає інші table/chain на тому самому hook
     # через return однієї з них) -- тож "довіру"/"ігнор" правильно
     # спрацьовує в кожній незалежно.
+    #
+    # trusted/ignore -- БЕЗ `ct state new` (на відміну від permanentBlock,
+    # який так само завжди без стану). Раніше було `ct state new ip saddr
+    # @trusted return`, і це було дірою: gen_cascade_dispatch входить у
+    # каскад і по `ct state new` (звичне з'єднання), і по `ct state invalid`
+    # + аномальні прапорці (stealth-скани, STEALTH_FLAG_MATCHES вище) --
+    # другий шлях НІЧИМ не був захищений trusted/ignore-перевіркою, бо та
+    # спрацьовувала тільки для `new`. Наслідок: джерело, довірене чи
+    # ігнороване, ЩО НАДІСЛАЛО хоча б один пакет, який conntrack вважає
+    # invalid (обірваний конntrack-запис, асиметричний роутинг, ретрансміт
+    # після давно забутого з'єднання -- це трапляється й у легітимного
+    # трафіку), усе одно потрапляло на level0..N/scan нарівні з будь-ким
+    # іншим. Перевірено наживо на реальному стані хосту -- саме так
+    # 176.104.57.1 (є і в trusted, і в ignore) опинилась на рівнях 0-4 й
+    # навіть у scan. Тепер `return` тут безумовний, як і в permanentBlock:
+    # "довірений"/"ігнорований" означає повне виключення з детекції, а не
+    # лише з її "звичайного" входу.
     local table="$1" chain="$2" ifm="${3:-}"
     echo "add rule ${table} ${chain} ${ifm}ip saddr @permanentBlock counter drop"
-    echo "add rule ${table} ${chain} ${ifm}ct state new ip saddr @trusted counter return"
-    echo "add rule ${table} ${chain} ${ifm}ct state new ip saddr @ignore counter return"
+    echo "add rule ${table} ${chain} ${ifm}ip saddr @trusted counter return"
+    echo "add rule ${table} ${chain} ${ifm}ip saddr @ignore counter return"
 }
 
 gen_static_guard6_rules() {
-    # permanentBlock6 / trusted6 / ignore6 -- та сама логіка, TABLE явним аргументом.
+    # permanentBlock6 / trusted6 / ignore6 -- та сама логіка (і те саме
+    # виправлення безумовного return), TABLE явним аргументом.
     local table="$1" chain="$2" ifm="${3:-}"
     echo "add rule ${table} ${chain} ${ifm}ip6 saddr @permanentBlock6 counter drop"
-    echo "add rule ${table} ${chain} ${ifm}ct state new ip6 saddr @trusted6 counter return"
-    echo "add rule ${table} ${chain} ${ifm}ct state new ip6 saddr @ignore6 counter return"
+    echo "add rule ${table} ${chain} ${ifm}ip6 saddr @trusted6 counter return"
+    echo "add rule ${table} ${chain} ${ifm}ip6 saddr @ignore6 counter return"
 }
 
 # ${OVERRIDE_DIR}/extra_forward_ifaces -- порожньо за замовчуванням (немає

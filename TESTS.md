@@ -772,6 +772,95 @@ chain forward {
 відновлення live-стану перевірені окремо (двічі поспіль, повний цикл
 `--reset-live-state` -> з'єднання -> `--stop` -> regen -> стан на місці).
 
+### 4. `trusted`/`ignore` не захищали від stealth-входу в каскад — знайдено на реальному хості
+
+Знахідка з живого `scan-detect-tool --show`: адреса присутня одночасно і
+в `trusted`, і в `ignore` (саме собою не баг — `trusted`-правило все одно
+спрацьовує першим, `ignore` просто ніколи не перевіряється для неї), і
+ОДНОЧАСНО на `level0`..`level4` і в `scan`. Це вже баг: довірена адреса
+не повинна опинятись на драбині взагалі.
+
+Причина — в порядку правил `input`/`fwd_N`:
+
+```
+ip saddr @permanentBlock counter drop                    <- безумовно
+ct state new ip saddr @trusted counter return             <- ТІЛЬКИ для ct state new
+ct state new ip saddr @ignore counter return               <- ТІЛЬКИ для ct state new
+...
+ct state new jump cascade_input                            <- вхід №1
+ct state invalid <аномальні прапорці> jump cascade_input   <- вхід №2 (stealth)
+```
+
+`trusted`/`ignore` перевірялись лише перед входом №1. Вхід №2 (доданий
+цього ж проходу аудиту, п.1 вище) ніяким чином не враховував ці сети —
+досить одного пакета, який conntrack вважає `invalid` (не обов'язково
+атака: обірваний conntrack-запис, асиметричний роутинг, запізнілий
+ретрансміт легітимної сесії), щоб довірене джерело потрапило на
+`level15` (стартовий рівень) так само, як і атакуюче.
+
+**Тест до виправлення (відтворення на чистій пісочниці):** `--no-docker
+--no-ipv6`, адреса `203.0.113.77` додана в `trusted`
+(`scan-detect-tool --add-trusted`), потім один спуфлений TCP FIN-пакет
+(raw-сокет, `IP_HDRINCL=1`, без попереднього SYN -> `ct state invalid`)
+надісланий із цієї адреси на `127.0.0.1`. До виправлення (стара версія
+guard-правил, відтворена вручну): лічильник stealth-правила зростав, і
+адреса з'являлась на `level15` попри `trusted`.
+
+**Виправлення:** `return` для `trusted`/`ignore` (і v6-варіантів) тепер
+без умови на `ct state`, так само, як і `drop` для `permanentBlock`
+(`gen_static_guard_rules`/`gen_static_guard6_rules`).
+
+**Тест після виправлення (той самий сценарій):**
+
+```
+=== ДО: правило invalid+fin у input ===
+    ct state invalid tcp flags fin / fin,syn,rst,ack counter packets 0 bytes 0 jump cascade_input
+=== Надсилаю спуфлений FIN від 203.0.113.77 (trusted) ===
+=== ПІСЛЯ: те саме правило (лічильник НЕ зріс) ===
+    ct state invalid tcp flags fin / fin,syn,rst,ack counter packets 0 bytes 0 jump cascade_input
+=== ПІСЛЯ: level0 -- порожній ===
+=== ПІСЛЯ: trusted -- return спрацював ===
+    ip saddr @trusted counter packets 1 bytes 40 return
+```
+
+Контрольний тест (та сама атака, НЕ-довірена адреса `198.51.100.9`) --
+підтверджує, що stealth-детекція й далі працює, а не просто вимкнена
+глобально:
+
+```
+=== stealth-правило (лічильник зріс) ===
+    ct state invalid tcp flags fin / fin,syn,rst,ack counter packets 1 bytes 40 jump cascade_input
+=== level15 (стартовий рівень) ===
+    elements = { 198.51.100.9 expires 43s800ms }
+```
+
+### 5. `scan-detect-tool --delete` розділено на "сходинки" й адмін-списки
+
+Наслідок п.4: адреса могла легально опинитись одночасно в `trusted` і на
+`level*` — і стара `--delete` мовчки видаляла звідусіль одразу, зокрема
+з `trusted`, хоча намір адміна найчастіше "скинь прогрес сканування", а
+не "перестань довіряти". Перевірено наживо (та сама пісочниця):
+
+```
+$ scan-detect-tool --delete 198.51.100.9      # тільки на "сходинках"
+Видаляю 198.51.100.9 зі "сходинок" ...:
+  - scanDetector: level15
+
+$ scan-detect-tool --delete 203.0.113.77      # є в trusted -- НЕ чіпає
+IP 203.0.113.77 не знайдено в жодному живому сеті "сходинок" ...
+(trusted після: 203.0.113.77 на місці)
+
+$ scan-detect-tool --delete-trusted 203.0.113.77   # нова команда
+Видаляю 203.0.113.77 з trusted (trusted):
+  - scanDetector: trusted
+  - srvProtector: trusted
+  - видалено з /etc/nft-scandetect/trusted-extra.list
+(trusted після: 203.0.113.77 прибрано, з ОБОХ таблиць і файлу)
+```
+
+`--delete-ignore`/`--delete-permanent` — та сама логіка, дзеркальна до
+`--add-ignore`/`--add-permanent`.
+
 ### Інше, перевірене в цьому ж проході
 
 - **Валідація `*-extra.list`**: рядок
