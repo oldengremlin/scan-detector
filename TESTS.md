@@ -878,3 +878,76 @@ $ scan-detect-tool --delete-trusted 203.0.113.77   # нова команда
 - **`scan-detect-tool`** з `common.sh`: `--show`/`--add-trusted`/`--list`/
   `--delete` бачать усі три таблиці (включно з додатковою srv-таблицею з
   підкаталогу), CLI-валідація відхиляє ін'єкційний аргумент.
+
+## Дедлок на завантаженні в `nftables.service.d/restart-scan-detector.conf`
+
+Знайдено на реальному хості (повідомлення адміна: "зіткнувся з взаємним
+блокуванням при завантаженні"), не в цій пісочниці -- тут немає робочого
+systemd як PID 1, тож повне відтворення дедлоку реальним перезавантаженням
+неможливе. Нижче -- аналіз механізму й те, що вдалось перевірити статично.
+
+**Механізм (детермінована поведінка job-скедулера systemd, не потребує
+емпіричної перевірки, щоб бути впевненим у причині -- лише в тому, що
+виправлення синтаксично коректне):**
+
+1. `nftables.service` стартує, виконує `ExecStartPre=nft-scan-detector
+   --stop` (ОК, синхронний і без залежності назад), потім сам flush+apply
+   `/etc/nftables.conf`, потім `ExecStartPost=systemctl restart
+   scan-detector.service`.
+2. Старий `ExecStartPost` -- без `--no-block` -- БЛОКУЄТЬСЯ, чекаючи, доки
+   job `scan-detector.service` не завершиться.
+3. `scan-detector.service` впорядкований `After=nftables.service` (див.
+   `systemd/scan-detector.service`) -- тож systemd не починає його job,
+   поки job САМОГО `nftables.service` не завершена.
+4. Job `nftables.service` не завершена, бо вона чекає завершення
+   `ExecStartPost` із кроку 2.
+
+Кругове очікування трьох подій: `nftables.service` чекає `ExecStartPost`,
+`ExecStartPost` чекає job `scan-detector.service`, та job чекає
+завершення `nftables.service`. На відміну від звичайного `Before=`/
+`After=`-циклу, systemd не бачить і не розриває це статично (на етапі
+парсингу юніт-файлів) -- цикл утворюється лише в runtime, через
+блокуючий викик усередині `ExecStartPost`. Практично це проявляється як
+підвисле завантаження (аж до `TimeoutStartSec`, типово 90s, на
+`nftables.service`, і так само на кожному юніті, впорядкованому після
+нього -- боляче саме тому, що nftables зазвичай рано в ланцюжку
+завантаження).
+
+**Виправлення:** `ExecStartPost=-/usr/bin/systemctl --no-block
+try-restart scan-detector.service` замість `restart` без прапорців.
+`--no-block` ставить job у черзі демона й повертається одразу, не
+чекаючи `JobRemoved` -- `ExecStartPost` завершується миттєво,
+`nftables.service` стає `active`, і щойно заблокована (на кроці 3) job
+`scan-detector.service` природно рушає далі, вже без жодного учасника,
+що чекає сам на себе. `try-restart` замість `restart` -- щоб цей хук НЕ
+стартував `scan-detector.service` на самому першому завантаженні
+(до того, як дійшла черга його власного `After=`) -- це робота звичайного
+впорядкування, а не цього хука; сенс хука -- лише відновити живий стан
+ПІСЛЯ пізнішого ручного/автоматичного рестарту `nftables.service` на вже
+працюючій системі, коли `scan-detector.service` і так `active`.
+
+**Перевірено статично** (найбільше, що можливо без реального
+перезавантаження хоста в цій пісочниці): стаб `nftables.service` +
+стаб `scan-detector.service` з ІДЕНТИЧНИМ `After=nftables.service`, і
+той самий drop-in-файл поруч (`nftables.service.d/
+restart-scan-detector.conf`), прогнані через `systemd-analyze verify`:
+
+```
+$ systemd-analyze verify nftables.service scan-detector.service
+(порожній вивід, exit 0)
+```
+
+Негативний контроль -- підтвердження, що `systemd-analyze verify`
+дійсно читає й враховує вміст drop-in-файлу, а не ігнорує його:
+
+```
+$ sed -i 's/ExecStartPost=.*/ExecStartPost=ЦеНеВалідноПевно/' .../restart-scan-detector.conf
+$ systemd-analyze verify nftables.service scan-detector.service
+nftables.service: Command ЦеНеВалідноПевно is not executable: No such file or directory
+exit 1
+```
+
+Тобто виправлений drop-in синтаксично коректний і дійсно перевірений
+інструментом, а не просто "виглядає правильно". Підтвердження, що сам
+дедлок на реальному завантаженні більше не виникає -- за адміном, живим
+перезавантаженням хоста (поза межами цієї пісочниці).
