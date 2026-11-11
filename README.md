@@ -176,6 +176,32 @@ sudo install -D -m 644 systemd/nftables.service.d/restart-scan-detector.conf \
 sudo systemctl daemon-reload
 ```
 
+**`ExecStartPost=` обов'язково з `--no-block` і `try-restart`, не простий
+`restart`.** Без `--no-block` — дедлок на завантаженні системи: `systemctl
+restart` (без прапорця) блокується, чекаючи завершення job
+`scan-detector.service`; та job не може навіть ПОЧАТИСЬ, бо
+`scan-detector.service` впорядкований `After=nftables.service`, а job
+самого `nftables.service` (у межах якої й виконується цей
+`ExecStartPost`) ще не завершена — вона чекає на завершення цього самого
+`ExecStartPost`. Кругове очікування трьох залежних одна-від-одної подій,
+яке systemd не може розірвати статично (цикл утворюється лише в момент
+виконання, а не видно з `Before=`/`After=` юніт-файлів) — проявляється як
+підвішене завантаження системи аж до `TimeoutStartSec` (типово 90s) на
+`nftables.service`, і так cascade на кожному юніті, впорядкованому після
+нього. `--no-block` ставить job у черзі й повертається одразу, не чекаючи
+результату — `ExecStartPost` завершується миттєво, `nftables.service`
+стає `active`, і вже тоді раніше заблокована job `scan-detector.service`
+природно рушає далі. `try-restart` замість `restart` — щоб цей хук не
+стартував `scan-detector.service` "передчасно" там, де це і без нього
+зробить штатне впорядкування (перший момент завантаження до власного
+`After=` у `scan-detector.service`); сенс хука — лише відновити стан
+ПІСЛЯ пізнішого ручного рестарту `nftables.service` на вже працюючій
+системі, коли `scan-detector.service` і так уже `active`. Перевірено
+статично (`systemd-analyze verify` на стаб-юнітах з тим самим
+`After=nftables.service`, з негативним контролем на синтаксичну
+помилку) — повний дедлок на реальному завантаженні відтворюється лише на
+хості з робочим systemd як PID 1, не в цій пісочниці.
+
 ## Як це працює
 
 Захист побудований на ДВОХ окремих `table inet`, кожна зі своєю ідеєю і
